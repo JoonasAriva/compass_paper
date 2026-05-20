@@ -1,0 +1,25 @@
+hydra:
+  run:
+    dir: /scratch/project_465002884/results/${experiment}/${model}/${dataloader.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+defaults:
+  - dataloader/2d_slice
+
+experiment: FocusMIL #ABMIL, compass, FocusMIL
+model: resnet18
+norm_layer: group
+pretrained: imagenet # imagenet/compass
+compass_filter : True
+distributed: False
+loss: bce
+loss_kwargs: {}
+
+epochs: 90
+weight_decay: 5e-4
+
+checkpoint_path: null
+
+
+
+
+

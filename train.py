@@ -1,0 +1,31 @@
+import logging
+import os
+
+import hydra
+from omegaconf import DictConfig
+
+from src.data.dataloader import NiftiDataModule
+from src.models import build_model
+from src.training.trainer import Trainer
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+os.environ["MIOPEN_USER_DB_PATH"] = f"/tmp/miopen_cache_{local_rank}"
+os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = f"/tmp/miopen_cache_{local_rank}"
+os.environ["WANDB__SERVICE_WAIT"] = "300"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S")
+
+
+@hydra.main(config_path="conf", config_name="config", version_base="1.1")
+def main(cfg: DictConfig):
+    model = build_model(cfg)
+    dataloader = NiftiDataModule(cfg)
+    trainer = Trainer(model, dataloader, cfg)
+    trainer.fit()
+
+
+if __name__ == "__main__":
+    main()
