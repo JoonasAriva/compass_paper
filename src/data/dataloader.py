@@ -53,15 +53,14 @@ class CTDataset(TorchDataset):
         if self.compass_filter:
             start_idx, end_idx = self.compass_filter.get_indexes(case_id=self.data[idx]["image"])
 
-            if start_idx is not None:
+            if start_idx is not None and end_idx > start_idx:
                 item["image"] = item["image"][:, start_idx:end_idx, :, :]
                 item["segmentation"] = item["segmentation"][:, start_idx:end_idx, :, :]
-            else:
-                item["compass_failed"] = True
 
         seg = item["segmentation"]
         # seg shape 1,D, H,W
         item["slice_classes"] = (seg == 2).any(dim=(2, 3))
+        item["normal_kidney_slices"] = (seg == 1).any(dim=(2, 3))
         item["scan_path"] = self.data[idx]["image"]
         num_slices = item["image"].shape[1]
         item["bag_index"] = torch.full((num_slices,), idx, dtype=torch.long)  # each slice tagged with scan idx
@@ -138,21 +137,22 @@ class NiftiDataModule:
 
         return sampler, sampler_test
 
-    def _make_loader(self, dataset, sampler, train: bool):
+    def _make_loader(self, dataset, sampler, train: bool, shuffle: bool):
         return DataLoader(
             dataset,
             batch_size=self.cfg.dataloader.batch_size,
-            shuffle=False,
+            shuffle=shuffle,
             num_workers=self.cfg.dataloader.train_workers if train else self.cfg.dataloader.val_workers,
             pin_memory=True,
             persistent_workers=True,
             prefetch_factor=self.cfg.dataloader.prefetch_factor,
             sampler=sampler,
             collate_fn=custom_collate,
+            generator=torch.Generator().manual_seed(self.cfg.seed)
         )
 
     def train_loader(self):
-        return self._make_loader(self.train_dataset, sampler=self.train_sampler, train=True)
+        return self._make_loader(self.train_dataset, sampler=self.train_sampler, train=True, shuffle=False)
 
     def test_loader(self):
-        return self._make_loader(self.test_dataset, sampler=self.test_sampler, train=False)
+        return self._make_loader(self.test_dataset, sampler=self.test_sampler, train=False, shuffle=self.cfg.notebook_eval)

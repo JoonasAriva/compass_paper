@@ -73,6 +73,13 @@ class Trainer:
                                   settings=wandb.Settings(init_timeout=120),
                                   config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
 
+            wandb.define_metric("f1_test", summary="max")
+            wandb.define_metric("f1_train", summary="max")
+            wandb.define_metric("loss_test", summary="min")
+            wandb.define_metric("loss_train", summary="min")
+            wandb.define_metric("bce_loss_test", summary="min")
+            wandb.define_metric("bce_loss_train", summary="min")
+
     def _build_scheduler(self, train_cases, train_controls):
         steps_in_epoch = 2 * min(train_cases, train_controls)
         total_steps = self.cfg.epochs * steps_in_epoch
@@ -193,24 +200,30 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 data_times.append(time.time() - data_loading_time)
                 scans = torch.squeeze(batch["image"]).to(self.device, non_blocking=True)  # (C, total_D, H, W)
-                scans = torch.permute(scans, (1, 0, 2, 3))  # C,D,H,W --> D,C,H,W
+                if self.cfg.mode == "2D":
+                    scans = torch.permute(scans, (1, 0, 2, 3))  # C,D,H,W --> D,C,H,W
+
+                elif self.cfg.mode == "3D":
+                    scans = torch.unsqueeze(torch.unsqueeze(scans[1, :, :, :], dim=0), dim=0)
                 labels = batch["class"].to(self.device, non_blocking=True).view(-1, 1).float()  # [B]->[B,1]
 
                 if self.cfg.dataloader.batch_size == 1 and self.cfg.compass_filter == False:
                     scan_end = batch["original_depth"].item()
-                else: # no padding
+                else:  # no padding
                     scan_end = scans.shape[0]
                 bag_index = batch["bag_index"].to(self.device, non_blocking=True)
 
                 if self.cfg.check:
-                    print("data shape: ", scans.shape, flush=True)
+                    print("scans shape: ", scans.shape, flush=True)
                     print("labels: ", labels.shape, flush=True)
                     print("scan_end: ", scan_end, flush=True)
+                    print("original_depth:", batch["original_depth"])
 
                 forward_time = time.time()
                 with torch.autocast(device_type="cuda"):
 
                     output = self.model(scans, scan_end=scan_end, training=train, bag_index=bag_index)
+
                     forward_times.append(time.time() - forward_time)
 
                     if len(forward_times) % 100 == 0:
@@ -223,7 +236,7 @@ class Trainer:
 
                     if self.cfg.experiment == "FocusMIL":
                         loss["total_loss"] += 0.1 * output["KL_loss"]
-                        loss["KL_loss"] += output["KL_loss"].item()
+                        results["KL_loss"] += output["KL_loss"].item()
 
                 if self.cfg.loss == "bce":
                     probability = torch.sigmoid(output["predictions"])
@@ -251,6 +264,7 @@ class Trainer:
                     self._print(f"Batch {step} CPU RAM: {process.memory_info().rss / 1e9:.2f} GB")
 
                 results["loss"] += loss["total_loss"].item()
+                results["bce_loss"] += loss["bce_loss"].item()
                 # results["depth_loss"] += loss["depth_loss"].item()
 
                 del loss, output

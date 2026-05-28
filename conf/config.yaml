@@ -5,8 +5,8 @@ hydra:
 defaults:
   - dataloader/2d_slice
 
-experiment: FocusMIL #ABMIL, compass, FocusMIL
-model: resnet18
+experiment: FocusMIL #ABMIL, compass, FocusMIL and now 3D
+model: resnet18 #_3D
 norm_layer: group
 pretrained: imagenet # imagenet/compass
 compass_filter : True
@@ -14,12 +14,13 @@ distributed: False
 loss: bce
 loss_kwargs: {}
 
-epochs: 90
+epochs: 120
 weight_decay: 5e-4
 
 checkpoint_path: null
+mode: 3D #3D, 2D
 
-
-
+notebook_eval: False
+seed: 42
 
 

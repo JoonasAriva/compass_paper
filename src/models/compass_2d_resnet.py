@@ -3,7 +3,7 @@ from collections import defaultdict
 import torch
 import torch.distributions as dist
 import torch.nn as nn
-import torch.nn.functional as F
+from monai.networks.nets import resnet18 as monai_resnet18
 from torchvision.models import resnet as resnet
 from torchvision.models import resnet18, resnet34, resnet50, ResNet34_Weights, ResNet18_Weights, ResNet50_Weights
 
@@ -33,6 +33,21 @@ def load_pretrained(model, name):
     fn, weights = _PRETRAINED[name]
     sd = fn(weights=weights).state_dict()
     missing, unexpected = model.load_state_dict(sd, strict=False)
+
+    if int(os.environ['LOCAL_RANK']) == 0:  # for multi gpu runs to reduce the spam
+        if missing:
+            print(f"[pretrained] missing keys: {missing}")
+        if unexpected:
+            print(f"[pretrained] unexpected keys: {unexpected}")
+
+
+def load_compass_trained(model):
+    sd = torch.load(
+        '/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-05-12/23-26-10/checkpoints/best.pth',
+        map_location='cuda:0', weights_only=True)
+    sd = sd["model"]
+    new_sd = {key.replace("module.", ""): value for key, value in sd.items()}
+    missing, unexpected = model.load_state_dict(state_dict=new_sd, strict=False)
 
     if int(os.environ['LOCAL_RANK']) == 0:  # for multi gpu runs to reduce the spam
         if missing:
@@ -83,7 +98,6 @@ class FocusMILClassificationHead(nn.Module):
         self.fc_ins = nn.Linear(instance_latent_dim, out_dim)
 
     def forward(self, z_ins, bag_idx):
-
         loc_ins_logits = self.fc_ins(z_ins)  # [N, 1]
 
         # Remap bag_idx to contiguous 0..B-1
@@ -111,7 +125,7 @@ class ResNetCompass(nn.Module):
         if pretrained == 'imagenet':
             load_pretrained(model, name)
         elif pretrained == 'compass':
-            pass  # TODO add compass trained weights here
+            load_compass_trained(model)
 
         self.backbone = nn.Sequential(*list(model.children())[:-2])
         self.num_features = model.fc.in_features
@@ -150,13 +164,30 @@ class ResNetCompass(nn.Module):
 
 
         elif self.framework == 'ABMIL':
-            attention = self.attention_head(pooled_feats) # (N,1)
 
-            normed_attention = F.softmax(attention, dim=0)
-            attention_aggregated_feature = (normed_attention * pooled_feats).sum(dim=0, keepdim=True)  # (1, 512)
+            attention = self.attention_head(pooled_feats)  # (N, 1)
 
-            output["predictions"] = self.classifier_ab(attention_aggregated_feature) # (1,1)
+            # Remap bag_idx to contiguous 0..B-1
+            bags, remapped_idx = bag_index[:scan_end].unique(return_inverse=True)
+            B = bags.shape[0]
 
+            # Softmax per bag (not globally)
+            # First exponentiate, then sum per bag, then normalize
+            exp_attention = torch.exp(attention - attention.max())  # (N, 1) numerical stability
+
+            # Sum exp per bag
+            exp_sum = torch.zeros(B, 1, device=pooled_feats.device, dtype=pooled_feats.dtype)
+            exp_sum.scatter_add_(0, remapped_idx.unsqueeze(1), exp_attention)
+
+            # Normalize per bag
+            normed_attention = exp_attention / exp_sum[remapped_idx]  # (N, 1)
+
+            # Weighted sum of features per bag
+            weighted_feats = normed_attention * pooled_feats  # (N, 512)
+            aggregated = torch.zeros(B, pooled_feats.shape[1], device=pooled_feats.device, dtype=pooled_feats.dtype)
+            aggregated.scatter_add_(0, remapped_idx.unsqueeze(1).expand(-1, pooled_feats.shape[1]), weighted_feats)
+
+            output["predictions"] = self.classifier_ab(aggregated)  # (B, 1)
             output["instance_scores"] = attention
 
 
@@ -186,3 +217,18 @@ class ResNetCompass(nn.Module):
         return output
 
 
+@register("resnet18_3D")
+class ResNet3DDepth(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.backbone = monai_resnet18(pretrained=False, spatial_dims=3, n_input_channels=1, num_classes=1)
+
+    @classmethod
+    def from_config(cls, cfg):
+        return cls()
+
+    def forward(self, x, **kwargs):
+        output = dict()
+        output["predictions"] = self.backbone(x)
+        return output

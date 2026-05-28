@@ -1,6 +1,6 @@
 import logging
 import os
-
+from src.training.training_utils import seed_everything
 import hydra
 from omegaconf import DictConfig
 
@@ -18,9 +18,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S")
 
-
 @hydra.main(config_path="conf", config_name="config", version_base="1.1")
 def main(cfg: DictConfig):
+    seed_everything(cfg.seed, local_rank=local_rank)
     model = build_model(cfg)
     dataloader = NiftiDataModule(cfg)
     trainer = Trainer(model, dataloader, cfg)
