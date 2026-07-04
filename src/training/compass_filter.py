@@ -7,8 +7,8 @@ class CompassFilter:
 
         self.df = pd.concat([pd.read_csv(df_train_path), pd.read_csv(df_test_path)])
 
-        self.filter_min = 5.5
-        self.filter_max = 25
+        self.filter_min = 11.86
+        self.filter_max = 31.73
 
         filtered = self.df[
             self.df["compass_scores"].between(self.filter_min, self.filter_max)

@@ -1,23 +1,24 @@
 import ctypes
 import gc
 import os
+import pickle
 import sys
 import time
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
-
+from src.models import build_model
 import math
 import numpy as np
 import psutil
 import torch
 import torch.optim as optim
 import wandb
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, roc_auc_score, confusion_matrix
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-
+from src.data.dataloader import NiftiDataModule
 from src.training.losses import build_loss
 from src.training.metrics import reduce_results_dict
 
@@ -74,6 +75,7 @@ class Trainer:
                                   config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
 
             wandb.define_metric("f1_test", summary="max")
+            wandb.define_metric("accuracy_test", summary="max")
             wandb.define_metric("f1_train", summary="max")
             wandb.define_metric("loss_test", summary="min")
             wandb.define_metric("loss_train", summary="min")
@@ -191,6 +193,9 @@ class Trainer:
         # for f1 score and other classification metrics
         outputs = []
         targets = []
+        probs = []
+        slice_outputs = []
+        slice_targets = []
 
         data_loading_time = time.time()
         full_loop_time = time.time()
@@ -204,7 +209,7 @@ class Trainer:
                     scans = torch.permute(scans, (1, 0, 2, 3))  # C,D,H,W --> D,C,H,W
 
                 elif self.cfg.mode == "3D":
-                    scans = torch.unsqueeze(torch.unsqueeze(scans[1, :, :, :], dim=0), dim=0)
+                    scans = torch.unsqueeze(torch.unsqueeze(scans, dim=0), dim=0)
                 labels = batch["class"].to(self.device, non_blocking=True).view(-1, 1).float()  # [B]->[B,1]
 
                 if self.cfg.dataloader.batch_size == 1 and self.cfg.compass_filter == False:
@@ -215,7 +220,8 @@ class Trainer:
 
                 if self.cfg.check:
                     print("scans shape: ", scans.shape, flush=True)
-                    print("labels: ", labels.shape, flush=True)
+                    print("label shape: ", labels.shape, flush=True)
+                    print("label value:", labels)
                     print("scan_end: ", scan_end, flush=True)
                     print("original_depth:", batch["original_depth"])
 
@@ -232,17 +238,46 @@ class Trainer:
 
                     loss = self.loss_function(output["predictions"], labels=labels,
                                               z_spacing=self.cfg.dataloader.spacing[0],
-                                              nth_slice=batch["subsample_step"])
+                                              nth_slice=batch["subsample_step"] if "subsample_step" in batch.keys() else None)
+
+                    if self.cfg.negative_instance_supervision and labels[0, 0] == 0:  # TODO extend to bs > 1
+
+                        out = output["instance_scores"]
+                        neg_labels = torch.zeros_like(out).to(self.device, non_blocking=True)
+
+                        neg_supervision_loss = self.loss_function(out, labels=neg_labels,
+                                                                  z_spacing=self.cfg.dataloader.spacing[0],
+                                                                  nth_slice=batch["subsample_step"])["bce_loss"]
+
+                        loss["total_loss"] += 0.01 * neg_supervision_loss  # 0.1 >> 0.01
+                        results["neg_supervision_loss"] += neg_supervision_loss.item()
 
                     if self.cfg.experiment == "FocusMIL":
                         loss["total_loss"] += 0.1 * output["KL_loss"]
                         results["KL_loss"] += output["KL_loss"].item()
 
                 if self.cfg.loss == "bce":
+
+                    results["bce_loss"] += loss["bce_loss"].item()
                     probability = torch.sigmoid(output["predictions"])
                     Y_hat = probability > 0.5
+
+                    probs.append(probability.detach().cpu())
                     outputs.append(Y_hat.detach().cpu())
                     targets.append(labels.detach().cpu())
+
+                    if self.cfg.mode == "2D":
+                        individual_predictions = output["instance_scores"]
+
+                        logit_class = (individual_predictions > 0.05).cpu().numpy().flatten().astype(int)
+
+                        slice_outputs.append(logit_class)
+                        slice_targets.append(batch["slice_classes"].numpy().flatten().astype(int))
+
+                        if self.cfg.check:
+                            print("slice predictions: ", len(individual_predictions))
+                            print("debug: ",batch["slice_classes"].shape)
+                            print("slice classes: ", len(batch["slice_classes"].numpy().flatten().astype(int)))
 
                 if train:
                     backprop_time = time.time()
@@ -264,7 +299,7 @@ class Trainer:
                     self._print(f"Batch {step} CPU RAM: {process.memory_info().rss / 1e9:.2f} GB")
 
                 results["loss"] += loss["total_loss"].item()
-                results["bce_loss"] += loss["bce_loss"].item()
+
                 # results["depth_loss"] += loss["depth_loss"].item()
 
                 del loss, output
@@ -289,10 +324,32 @@ class Trainer:
         if self.cfg.loss == "bce":
             outputs = np.concatenate(outputs)
             targets = np.concatenate(targets)
+            probs = np.concatenate(probs)
             results["f1"] = f1_score(targets, outputs, average='macro')
+            if len(np.unique(targets)) > 1:
+                results["AUC_ROC"] = roc_auc_score(targets, probs)
+            else:
+                results["AUC_ROC"] = float("nan")
+            cm = confusion_matrix(targets, outputs)
+            if cm.size == 1:
+                # model is predicting only one class, skip metrics this epoch
+                tn, fp, fn, tp = (cm[0, 0], 0, 0, 0) if outputs[0] == 0 else (0, 0, 0, cm[0, 0])
+            else:
+                tn, fp, fn, tp = cm.ravel()
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+            results["specificity"] = specificity
             results["precision"] = precision_score(targets, outputs, average='binary')
             results["recall"] = recall_score(targets, outputs, average='binary')
             results["accuracy"] = accuracy_score(targets, outputs)
+
+            if self.cfg.mode == "2D":
+                slice_outputs_flat = np.concatenate(slice_outputs)
+                slice_targets_flat = np.concatenate(slice_targets)
+
+                results["slice_f1"] = f1_score(slice_targets_flat, slice_outputs_flat, average='macro', zero_division=0)
+                results["slice_precision"] = precision_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
+                results["slice_recall"] = recall_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
+                results["slice_accuracy"] = accuracy_score(slice_targets_flat, slice_outputs_flat)
 
         self._print(f"Rank {self.local_rank} - Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         self._print(f"Rank {self.local_rank} - Max memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
@@ -318,12 +375,15 @@ class Trainer:
     def _load_checkpoint(self):
         ckpt = torch.load(self.cfg.checkpoint_path, map_location=self.device)
         getattr(self.model, "module", self.model).load_state_dict(ckpt["model"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.scheduler.load_state_dict(ckpt["scheduler"])
-        self.scaler.load_state_dict(ckpt["scaler"])
-        self._print(f"Resumed from checkpoint: {self.cfg.checkpoint_path}")
 
-        if self.cfg.trainer.distributed:
+        if not self.cfg.kits_kirc_eval:
+
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+            self.scaler.load_state_dict(ckpt["scaler"])
+            self._print(f"Resumed from checkpoint: {self.cfg.checkpoint_path}")
+
+        if self.cfg.distributed:
             torch.distributed.barrier()
 
         return ckpt["epoch"]
@@ -335,6 +395,7 @@ class Trainer:
     def fit(self):
 
         best_test_loss = float("inf")
+        best_f1 = 0
         start_epoch = 0
 
         train_loader = self.datamodule.train_loader()
@@ -390,7 +451,11 @@ class Trainer:
             if epoch_results["loss_test"] < best_test_loss:
                 best_test_loss = epoch_results["loss_test"]
                 self._print(f"Best test loss achieved {best_test_loss} at epoch {epoch}!")
-                self._save_checkpoint("best.pth", epoch=epoch)
+                self._save_checkpoint("best_loss.pth", epoch=epoch)
+            if epoch_results["f1_test"] > best_f1:
+                best_f1 = epoch_results["f1_test"]
+                self._print(f"Best test f1 achieved {best_f1} at epoch {epoch}!")
+                self._save_checkpoint("best_f1.pth", epoch=epoch)
             else:
 
                 self._save_checkpoint("current.pth", epoch=epoch)
@@ -398,3 +463,67 @@ class Trainer:
 
             gc.collect()
             torch.cuda.empty_cache()
+
+    def eval(self):
+        # for kits and/or Kirc
+        self.datamodule = NiftiDataModule(self.cfg)
+        test_loader = self.datamodule.test_loader()
+
+        if self.cfg.dataloader.kits:
+            eval_data = "kits"
+        elif self.cfg.dataloader.kirc:
+            eval_data = "kirc"
+        else:
+            self._print("Unknown eval data")
+
+        model_dict = {"FocusMIL_comp": "/scratch/project_465002884/results/FocusMIL/resnet18/2d_slice/2026-06-25/16-13-52/checkpoints/best.pth",
+                      "FocusMIL": "/scratch/project_465002884/results/FocusMIL/resnet18/2d_slice/2026-06-26/00-41-23/checkpoints/best_f1.pth",
+                      "ABMIL": "/scratch/project_465002884/results/ABMIL/resnet18/2d_slice/2026-06-25/18-22-18/checkpoints/best_f1.pth",
+                      "ABMIL_comp": "/scratch/project_465002884/results/ABMIL/resnet18/2d_slice/2026-06-25/17-52-16/checkpoints/best_f1.pth",}
+
+        for key in model_dict.keys():
+            print("Model: ", key)
+
+            if "Focus" in key:
+                self.cfg.experiment = "FocusMIL"
+            elif "ABMIL" in key:
+                self.cfg.experiment = "ABMIL"
+            else:
+                self._print("Unknown model")
+
+            # if "comp" in key:
+            #     self.cfg.compass_filter = True
+            # else:
+            #     self.cfg.compass_filter = False
+
+            self.model = build_model(self.cfg).cuda()
+            self.cfg.checkpoint_path = model_dict[key]
+            self._load_checkpoint()
+
+            epoch_results = dict()
+
+            test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
+
+            test_results = {k + '_test': v for k, v in test_results.items()}
+
+            epoch_results.update(test_results)
+
+            if torch.distributed.is_initialized():
+
+                if torch.distributed.is_initialized():
+                    t = time.time()
+                    epoch_results = reduce_results_dict(epoch_results)
+                    self._print(f"reduce took {time.time() - t:.1f}s")
+
+            self._print(f"==================== METRICS =========================")
+            self._print(epoch_results)
+
+            with open(f'{eval_data}_results_{key}.pkl', 'wb') as f:
+                pickle.dump(epoch_results, f)
+                self._print(f"results saved to .pkl")
+            gc.collect()
+            torch.cuda.empty_cache()
+        if self.cfg.check:
+            self._print("Model check completed")
+            return
+

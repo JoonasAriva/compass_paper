@@ -4,7 +4,7 @@ os.environ["MIOPEN_USER_DB_PATH"] = "/tmp/miopen_cache_warmup"
 os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = "/tmp/miopen_cache_warmup"
 
 from hydra import initialize, compose
-from src.data.dataloader import NiftiDataModule, validate_cache
+from src.data.dataloader import NiftiDataModule
 from torch.utils.data import DataLoader
 
 with initialize(config_path="conf", version_base=None):

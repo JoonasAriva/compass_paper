@@ -3,23 +3,28 @@ hydra:
     dir: /scratch/project_465002884/results/${experiment}/${model}/${dataloader.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 defaults:
-  - dataloader/2d_slice
+  - dataloader/2d_slice #dataloader/3d_scan or /2d_slice
 
-experiment: FocusMIL #ABMIL, compass, FocusMIL and now 3D
+experiment: ABMIL #ABMIL, compass, FocusMIL and now 3D
 model: resnet18 #_3D
 norm_layer: group
 pretrained: imagenet # imagenet/compass
 compass_filter : True
 distributed: False
-loss: bce
+
+loss: bce #bce/depth
 loss_kwargs: {}
 
-epochs: 120
+epochs: 150
 weight_decay: 5e-4
+patch_mode: True
+mode: 2D #3D, 2D
+
+kits_kirc_eval: False
+
+negative_instance_supervision: False
 
 checkpoint_path: null
-mode: 3D #3D, 2D
-
 notebook_eval: False
 seed: 42
 

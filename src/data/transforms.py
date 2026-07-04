@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 from monai import transforms as T
 from monai.transforms import MapTransform
@@ -17,18 +16,18 @@ class SubsampleSlicesd(MapTransform):
     def __call__(self, data):
         d = dict(data)
         # Get depth from the first available key
-        for key in self.key_iterator(d):
-            if d[key].ndim >= 4:  # safety check
-                depth = d[key].shape[1]  # [C, D, H, W]
-                step = 1 if depth < 300 else self.default_step
-                break
-        else:
-            # No valid key found
-            return d
-        d["subsample_step"] = step
+        # for key in self.key_iterator(d):
+        #     if d[key].ndim >= 4:  # safety check
+        #         depth = d[key].shape[1]  # [C, D, H, W]
+        #         #step = 1 if depth < 300 else self.default_step
+        #         break
+        #     else:
+        #         # No valid key found
+        #         return d
+        d["subsample_step"] = self.default_step
         # Apply to all keys
         for key in self.key_iterator(d):
-            d[key] = d[key][:, ::step, :, :]
+            d[key] = d[key][:, ::self.default_step, :, :]
 
         return d
 
@@ -56,8 +55,9 @@ class AddNeighbourSlicesd(T.MapTransform):
             d[key] = x_stack  # (3, D-2, H, W)
         return d
 
+
 def get_deterministic_transforms(cfg):
-    return T.Compose([
+    transforms = [
         T.LoadImaged(keys=["image", "segmentation"]),
         T.EnsureChannelFirstd(keys=["image", "segmentation"]),
         T.Orientationd(keys=["image", "segmentation"], axcodes="SPR", labels=None),
@@ -67,19 +67,25 @@ def get_deterministic_transforms(cfg):
         T.ScaleIntensityRanged(keys=["image"],
                                a_min=cfg.dataloader.intensity_min,
                                a_max=cfg.dataloader.intensity_max,
-                               b_min=0.0, b_max=1.0, clip=True),
-        AddNeighbourSlicesd(keys=["image"]),
-        SubsampleSlicesd(keys=["image", "segmentation"], step=3),
-        T.CenterSpatialCropd(keys=["image", "segmentation"],
-                             roi_size=(cfg.dataloader.depth_crop,
-                                       cfg.dataloader.axial_crop,
-                                       cfg.dataloader.axial_crop)),
-        SaveShapedd(keys=["image"]),
-        T.SpatialPadd(keys=["image"],
-                      spatial_size=(cfg.dataloader.depth_crop, cfg.dataloader.axial_crop, cfg.dataloader.axial_crop),
-                      method="end", constant_values=0),
-        T.ToTensord(keys=["image", "segmentation"]),
-    ])
+                               b_min=0.0, b_max=1.0, clip=True)]
+
+    if cfg.dataloader.subsample_slices:
+        transforms.extend(
+            [AddNeighbourSlicesd(keys=["image", "segmentation"]),
+             SubsampleSlicesd(keys=["image", "segmentation"], step=3)])
+
+    transforms += [T.CenterSpatialCropd(keys=["image", "segmentation"],
+                                        roi_size=(cfg.dataloader.depth_crop,
+                                                  cfg.dataloader.axial_crop,
+                                                  cfg.dataloader.axial_crop)),
+                   SaveShapedd(keys=["image"]),
+                   T.SpatialPadd(keys=["image", "segmentation"],
+                                 spatial_size=(
+                                     cfg.dataloader.depth_crop, cfg.dataloader.axial_crop, cfg.dataloader.axial_crop),
+                                 method="end", constant_values=0),
+                   T.ToTensord(keys=["image", "segmentation"])]
+
+    return T.Compose(transforms)
 
 
 def get_augmentation_transforms(mode):
@@ -89,4 +95,13 @@ def get_augmentation_transforms(mode):
     return T.Compose([
         T.RandFlipd(keys=["image", "segmentation"], prob=0.5, spatial_axis=1),
         T.RandRotate90d(keys=["image", "segmentation"], prob=0.5, spatial_axes=(1, 2)),
+        # Mild random zoom
+        # T.RandZoomd(keys=["image", "segmentation"],
+        #             prob=1,
+        #             min_zoom=0.9, max_zoom=1.1,
+        #             mode=("bilinear", "nearest")),
+
+        # Intensity - only on image, not segmentation
+        T.RandGaussianNoised(keys=["image"], prob=0.3, mean=0.0, std=0.05),
+        T.RandScaleIntensityd(keys=["image"], prob=0.3, factors=0.1)
     ])

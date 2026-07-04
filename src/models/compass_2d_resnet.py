@@ -188,7 +188,8 @@ class ResNetCompass(nn.Module):
             aggregated.scatter_add_(0, remapped_idx.unsqueeze(1).expand(-1, pooled_feats.shape[1]), weighted_feats)
 
             output["predictions"] = self.classifier_ab(aggregated)  # (B, 1)
-            output["instance_scores"] = attention
+            output["instance_attention"] = attention
+            output["instance_scores"] = self.classifier_ab(pooled_feats)
 
 
         elif self.framework == 'FocusMIL':

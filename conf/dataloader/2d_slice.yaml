@@ -1,17 +1,20 @@
-base_path: /scratch/project_465001979/ct_data/kidney/
-tuh_only: false
+base_path: /scratch/project_465002884/kidney/
+
+tuh: true
 tuh_extra_data: true
+kits: false
+kirc: false
 
 batch_size: 1
 train_workers: 4
 val_workers: 2
-spacing: [2.0, 2.0, 2.0] #[2.0, 0.84, 0.84]
-#patch_size: [1, 500, 500]
+spacing: [2.0, 2.0, 2.0]
 intensity_min: -150
 intensity_max: 250
 axial_crop: 250
 depth_crop: 300
 prefetch_factor: 2
 name: 2d_slice
+subsample_slices: True
 
-cache_dir: /scratch/project_465002884/monai_cache/sp${dataloader.spacing[0]}_${dataloader.spacing[1]}_crop${dataloader.depth_crop}_ax${dataloader.axial_crop}
+cache_dir: /scratch/project_465002884/monai_cache/${dataloader.name}/sp${dataloader.spacing[0]}_${dataloader.spacing[1]}_crop${dataloader.depth_crop}_ax${dataloader.axial_crop}

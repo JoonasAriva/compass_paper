@@ -24,7 +24,12 @@ def main(cfg: DictConfig):
     model = build_model(cfg)
     dataloader = NiftiDataModule(cfg)
     trainer = Trainer(model, dataloader, cfg)
-    trainer.fit()
+
+    if cfg.kits_kirc_eval:
+        print("Just evaluating")
+        trainer.eval()
+    else:
+        trainer.fit()
 
 
 if __name__ == "__main__":
