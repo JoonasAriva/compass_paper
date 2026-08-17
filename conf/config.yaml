@@ -5,8 +5,8 @@ hydra:
 defaults:
   - dataloader/2d_slice #dataloader/3d_scan or /2d_slice
 
-experiment: ABMIL #ABMIL, compass, FocusMIL and now 3D
-model: resnet18 #_3D
+experiment: 3D #ABMIL, compass, FocusMIL and now 3D
+model: resnet18_3D #_3D
 norm_layer: group
 pretrained: imagenet # imagenet/compass
 compass_filter : True
@@ -17,15 +17,13 @@ loss_kwargs: {}
 
 epochs: 150
 weight_decay: 5e-4
-patch_mode: True
-mode: 2D #3D, 2D
-
-kits_kirc_eval: False
+patch_mode: False
+mode: 3D #3D, 2D
 
 negative_instance_supervision: False
 
 checkpoint_path: null
 notebook_eval: False
-seed: 42
+seed: 42 #42 52 62
 
 

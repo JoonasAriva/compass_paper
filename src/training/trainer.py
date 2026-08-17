@@ -7,20 +7,22 @@ import time
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
-from src.models import build_model
+
 import math
 import numpy as np
 import psutil
 import torch
 import torch.optim as optim
 import wandb
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_auc_score
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+
 from src.data.dataloader import NiftiDataModule
+from src.models import build_model
 from src.training.losses import build_loss
-from src.training.metrics import reduce_results_dict
+from src.training.metrics import reduce_epoch_results, compute_confusion_metrics
 
 sys.path.append('/users/arivajoo/GPAI')
 from omegaconf import OmegaConf
@@ -209,7 +211,8 @@ class Trainer:
                     scans = torch.permute(scans, (1, 0, 2, 3))  # C,D,H,W --> D,C,H,W
 
                 elif self.cfg.mode == "3D":
-                    scans = torch.unsqueeze(torch.unsqueeze(scans, dim=0), dim=0)
+                    scans = torch.unsqueeze(torch.unsqueeze(scans[1], dim=0), dim=0)
+                    # scans = torch.unsqueeze(torch.unsqueeze(scans, dim=0), dim=0)
                 labels = batch["class"].to(self.device, non_blocking=True).view(-1, 1).float()  # [B]->[B,1]
 
                 if self.cfg.dataloader.batch_size == 1 and self.cfg.compass_filter == False:
@@ -238,7 +241,8 @@ class Trainer:
 
                     loss = self.loss_function(output["predictions"], labels=labels,
                                               z_spacing=self.cfg.dataloader.spacing[0],
-                                              nth_slice=batch["subsample_step"] if "subsample_step" in batch.keys() else None)
+                                              nth_slice=batch[
+                                                  "subsample_step"] if "subsample_step" in batch.keys() else None)
 
                     if self.cfg.negative_instance_supervision and labels[0, 0] == 0:  # TODO extend to bs > 1
 
@@ -276,7 +280,7 @@ class Trainer:
 
                         if self.cfg.check:
                             print("slice predictions: ", len(individual_predictions))
-                            print("debug: ",batch["slice_classes"].shape)
+                            print("debug: ", batch["slice_classes"].shape)
                             print("slice classes: ", len(batch["slice_classes"].numpy().flatten().astype(int)))
 
                 if train:
@@ -325,31 +329,44 @@ class Trainer:
             outputs = np.concatenate(outputs)
             targets = np.concatenate(targets)
             probs = np.concatenate(probs)
-            results["f1"] = f1_score(targets, outputs, average='macro')
-            if len(np.unique(targets)) > 1:
-                results["AUC_ROC"] = roc_auc_score(targets, probs)
-            else:
-                results["AUC_ROC"] = float("nan")
-            cm = confusion_matrix(targets, outputs)
-            if cm.size == 1:
-                # model is predicting only one class, skip metrics this epoch
-                tn, fp, fn, tp = (cm[0, 0], 0, 0, 0) if outputs[0] == 0 else (0, 0, 0, cm[0, 0])
-            else:
-                tn, fp, fn, tp = cm.ravel()
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-            results["specificity"] = specificity
-            results["precision"] = precision_score(targets, outputs, average='binary')
-            results["recall"] = recall_score(targets, outputs, average='binary')
-            results["accuracy"] = accuracy_score(targets, outputs)
+            # results["f1"] = f1_score(targets, outputs, average='macro')
+            # if len(np.unique(targets)) > 1:
+            #     results["AUC_ROC"] = roc_auc_score(targets, probs)
+            # else:
+            #     results["AUC_ROC"] = float("nan")
+            cm = confusion_matrix(targets, outputs, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel()
+            results["tn"] = tn
+            results["fp"] = fp
+            results["fn"] = fn
+            results["tp"] = tp
+            results["n_samples"] = len(targets)
+            results["labels"] = targets
+            results["predictions"] = probs
+
+            # specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+            # results["specificity"] = specificity
+            # results["precision"] = precision_score(targets, outputs, average='binary')
+            # results["recall"] = recall_score(targets, outputs, average='binary')
+            # results["accuracy"] = accuracy_score(targets, outputs)
 
             if self.cfg.mode == "2D":
                 slice_outputs_flat = np.concatenate(slice_outputs)
                 slice_targets_flat = np.concatenate(slice_targets)
 
-                results["slice_f1"] = f1_score(slice_targets_flat, slice_outputs_flat, average='macro', zero_division=0)
-                results["slice_precision"] = precision_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
-                results["slice_recall"] = recall_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
-                results["slice_accuracy"] = accuracy_score(slice_targets_flat, slice_outputs_flat)
+                cm = confusion_matrix(slice_targets_flat, slice_outputs_flat, labels=[0, 1])
+                tn_slice, fp_slice, fn_slice, tp_slice = cm.ravel()
+
+                results["tn_slice"] = tn_slice
+                results["fp_slice"] = fp_slice
+                results["fn_slice"] = fn_slice
+                results["tp_slice"] = tp_slice
+                results["n_slice_samples"] = len(slice_outputs_flat)
+
+                # results["slice_f1"] = f1_score(slice_targets_flat, slice_outputs_flat, average='macro', zero_division=0)
+                # results["slice_precision"] = precision_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
+                # results["slice_recall"] = recall_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
+                # results["slice_accuracy"] = accuracy_score(slice_targets_flat, slice_outputs_flat)
 
         self._print(f"Rank {self.local_rank} - Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         self._print(f"Rank {self.local_rank} - Max memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
@@ -359,10 +376,10 @@ class Trainer:
 
         return results
 
-    def _save_checkpoint(self, name, epoch):
+    def _save_checkpoint(self, name, epoch, save_path=False):
 
+        dir_checkpoint = Path('./checkpoints/')
         if self.is_main_process:
-            dir_checkpoint = Path('./checkpoints/')
             dir_checkpoint.mkdir(parents=True, exist_ok=True)
 
             torch.save({
@@ -371,17 +388,16 @@ class Trainer:
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
             }, f"{dir_checkpoint}/{name}")
+        if save_path:
+            self.cfg.checkpoint_path = f"{dir_checkpoint}/{name}"
 
     def _load_checkpoint(self):
         ckpt = torch.load(self.cfg.checkpoint_path, map_location=self.device)
         getattr(self.model, "module", self.model).load_state_dict(ckpt["model"])
-
-        if not self.cfg.kits_kirc_eval:
-
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-            self.scheduler.load_state_dict(ckpt["scheduler"])
-            self.scaler.load_state_dict(ckpt["scaler"])
-            self._print(f"Resumed from checkpoint: {self.cfg.checkpoint_path}")
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.scheduler.load_state_dict(ckpt["scheduler"])
+        # self.scaler.load_state_dict(ckpt["scaler"])
+        self._print(f"Resumed from checkpoint: {self.cfg.checkpoint_path}")
 
         if self.cfg.distributed:
             torch.distributed.barrier()
@@ -395,7 +411,7 @@ class Trainer:
     def fit(self):
 
         best_test_loss = float("inf")
-        best_f1 = 0
+        best_f1 = -1
         start_epoch = 0
 
         train_loader = self.datamodule.train_loader()
@@ -415,7 +431,7 @@ class Trainer:
             self._print(f"Starting epoch {epoch}")
 
             self._print(f"CPU RAM start: {process.memory_info().rss / 1e9:.2f} GB")
-            epoch_results = dict()
+
             train_results = self._run_epoch(self.model, train_loader, total_steps=train_steps_in_epoch, train=True)
             self._print(f"CPU RAM after train: {process.memory_info().rss / 1e9:.2f} GB")
             ctypes.CDLL("libc.so.6").malloc_trim(0)  # forces glibc to return memory to OS
@@ -424,18 +440,17 @@ class Trainer:
             test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
             self._print(f"CPU RAM after test: {process.memory_info().rss / 1e9:.2f} GB")
 
-            train_results = {k + '_train': v for k, v in train_results.items()}
-            test_results = {k + '_test': v for k, v in test_results.items()}
-
-            epoch_results.update(train_results)
-            epoch_results.update(test_results)
-
             if torch.distributed.is_initialized():
+                train_metrics = reduce_epoch_results(train_results)
+                test_metrics = reduce_epoch_results(test_results)
 
-                if torch.distributed.is_initialized():
-                    t = time.time()
-                    epoch_results = reduce_results_dict(epoch_results)
-                    self._print(f"reduce took {time.time() - t:.1f}s")
+            else:
+                train_metrics = self.single_gpu_compute_metrics(train_results)
+                test_metrics = self.single_gpu_compute_metrics(test_results)
+
+            epoch_results = {}
+            epoch_results.update({f"{k}_train": v for k, v in train_metrics.items()})
+            epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
 
             if self.cfg.check:
                 self._print("Model check completed")
@@ -455,7 +470,7 @@ class Trainer:
             if epoch_results["f1_test"] > best_f1:
                 best_f1 = epoch_results["f1_test"]
                 self._print(f"Best test f1 achieved {best_f1} at epoch {epoch}!")
-                self._save_checkpoint("best_f1.pth", epoch=epoch)
+                self._save_checkpoint("best_f1.pth", epoch=epoch, save_path=True)
             else:
 
                 self._save_checkpoint("current.pth", epoch=epoch)
@@ -464,66 +479,84 @@ class Trainer:
             gc.collect()
             torch.cuda.empty_cache()
 
+    def single_gpu_compute_metrics(self, results_dict):
+
+        metrics = compute_confusion_metrics(results_dict["tn"], results_dict["fp"], results_dict["fn"],
+                                            results_dict["tp"])
+        metrics["auc_roc"] = roc_auc_score(results_dict["labels"], results_dict["predictions"])
+        metrics["n_samples"] = results_dict["n_samples"]
+        for k, v in results_dict.items():
+            if "loss" in k:
+                metrics[k] = v
+
+        if self.cfg.mode == "2D":
+            slice_metrics = compute_confusion_metrics(
+                results_dict["tn_slice"], results_dict["fp_slice"],
+                results_dict["fn_slice"], results_dict["tp_slice"]
+            )
+            for k, v in slice_metrics.items():
+                metrics[f"{k}_slice"] = v
+            metrics["n_samples_slice"] = results_dict["n_slice_samples"]
+
+        return metrics
+
     def eval(self):
         # for kits and/or Kirc
+        self._print("Start evaluation on KITS and KIRC")
+        self.cfg.dataloader.kits = True
+        self.cfg.dataloader.kirc = False
+        self.cfg.dataloader.tuh = False
+        self.cfg.dataloader.tuh_extra_data = False
+
         self.datamodule = NiftiDataModule(self.cfg)
         test_loader = self.datamodule.test_loader()
 
-        if self.cfg.dataloader.kits:
-            eval_data = "kits"
-        elif self.cfg.dataloader.kirc:
-            eval_data = "kirc"
-        else:
-            self._print("Unknown eval data")
+        self.model = build_model(self.cfg).cuda()
 
-        model_dict = {"FocusMIL_comp": "/scratch/project_465002884/results/FocusMIL/resnet18/2d_slice/2026-06-25/16-13-52/checkpoints/best.pth",
-                      "FocusMIL": "/scratch/project_465002884/results/FocusMIL/resnet18/2d_slice/2026-06-26/00-41-23/checkpoints/best_f1.pth",
-                      "ABMIL": "/scratch/project_465002884/results/ABMIL/resnet18/2d_slice/2026-06-25/18-22-18/checkpoints/best_f1.pth",
-                      "ABMIL_comp": "/scratch/project_465002884/results/ABMIL/resnet18/2d_slice/2026-06-25/17-52-16/checkpoints/best_f1.pth",}
-
-        for key in model_dict.keys():
-            print("Model: ", key)
-
-            if "Focus" in key:
-                self.cfg.experiment = "FocusMIL"
-            elif "ABMIL" in key:
-                self.cfg.experiment = "ABMIL"
-            else:
-                self._print("Unknown model")
-
-            # if "comp" in key:
-            #     self.cfg.compass_filter = True
-            # else:
-            #     self.cfg.compass_filter = False
-
-            self.model = build_model(self.cfg).cuda()
-            self.cfg.checkpoint_path = model_dict[key]
+        if not self.cfg.check:
             self._load_checkpoint()
 
-            epoch_results = dict()
+        test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
 
-            test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
+        if torch.distributed.is_initialized():
+            test_metrics = reduce_epoch_results(test_results)
+        else:
+            test_metrics = self.single_gpu_compute_metrics(test_results)
 
-            test_results = {k + '_test': v for k, v in test_results.items()}
+        epoch_results = {}
+        epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
 
-            epoch_results.update(test_results)
+        self._print(f"==================== KITS METRICS =========================")
+        self._print(epoch_results)
 
-            if torch.distributed.is_initialized():
+        with open(f'KITS_results_.pkl', 'wb') as f:
+            pickle.dump(epoch_results, f)
+            self._print(f"results saved to .pkl")
+        gc.collect()
+        torch.cuda.empty_cache()
 
-                if torch.distributed.is_initialized():
-                    t = time.time()
-                    epoch_results = reduce_results_dict(epoch_results)
-                    self._print(f"reduce took {time.time() - t:.1f}s")
+        self.cfg.dataloader.kits = False
+        self.cfg.dataloader.kirc = True
 
-            self._print(f"==================== METRICS =========================")
-            self._print(epoch_results)
+        self.datamodule = NiftiDataModule(self.cfg)
+        test_loader = self.datamodule.test_loader()
 
-            with open(f'{eval_data}_results_{key}.pkl', 'wb') as f:
-                pickle.dump(epoch_results, f)
-                self._print(f"results saved to .pkl")
-            gc.collect()
-            torch.cuda.empty_cache()
+        test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
+
+        if torch.distributed.is_initialized():
+            test_metrics = reduce_epoch_results(test_results)
+        else:
+            test_metrics = self.single_gpu_compute_metrics(test_results)
+
+        epoch_results = {}
+        epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
+
+        self._print(f"==================== KIRC METRICS =========================")
+        self._print(epoch_results)
+
+        with open(f'KIRC_results_.pkl', 'wb') as f:
+            pickle.dump(epoch_results, f)
+            self._print(f"results saved to .pkl")
+
         if self.cfg.check:
             self._print("Model check completed")
-            return
-

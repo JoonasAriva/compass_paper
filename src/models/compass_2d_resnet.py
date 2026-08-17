@@ -43,7 +43,7 @@ def load_pretrained(model, name):
 
 def load_compass_trained(model):
     sd = torch.load(
-        '/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-05-12/23-26-10/checkpoints/best.pth',
+        '/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-06-10/16-44-14/checkpoints/best.pth',
         map_location='cuda:0', weights_only=True)
     sd = sd["model"]
     new_sd = {key.replace("module.", ""): value for key, value in sd.items()}
@@ -55,7 +55,7 @@ def load_compass_trained(model):
         if unexpected:
             print(f"[pretrained] unexpected keys: {unexpected}")
 
-
+    print("loaded compass weights")
 class AttentionHead(nn.Module):
     def __init__(self, input_dim, intermediate_dim, output_dim):
         super(AttentionHead, self).__init__()
@@ -124,8 +124,7 @@ class ResNetCompass(nn.Module):
         model = resnet.ResNet(arch_cfg["block"], arch_cfg["layers"], norm_layer=norm)
         if pretrained == 'imagenet':
             load_pretrained(model, name)
-        elif pretrained == 'compass':
-            load_compass_trained(model)
+
 
         self.backbone = nn.Sequential(*list(model.children())[:-2])
         self.num_features = model.fc.in_features
@@ -139,9 +138,11 @@ class ResNetCompass(nn.Module):
             self.classifier_ab = nn.Linear(self.num_features, 1)
 
         elif framework == 'FocusMIL':
-            self.vae = VariationalEncoder(latent_dim=128, in_dim=self.num_features)
-            self.classifier_focus = FocusMILClassificationHead(instance_latent_dim=128)
+            self.vae = VariationalEncoder(latent_dim=128, in_dim=self.num_features) #128
+            self.classifier_focus = FocusMILClassificationHead(instance_latent_dim=128) #128
 
+        if pretrained == 'compass':
+            load_compass_trained(self)
     @classmethod
     def from_config(cls, cfg):
         return cls(
@@ -161,6 +162,7 @@ class ResNetCompass(nn.Module):
 
         if self.framework == 'compass':
             output["predictions"] = self.classifier(pooled_feats)
+            output["feature_vector"] = pooled_feats
 
 
         elif self.framework == 'ABMIL':
@@ -223,7 +225,9 @@ class ResNet3DDepth(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.backbone = monai_resnet18(pretrained=False, spatial_dims=3, n_input_channels=1, num_classes=1)
+        self.backbone = monai_resnet18(pretrained=True, spatial_dims=3, n_input_channels=1,
+                                       feed_forward=False,shortcut_type="A",bias_downsample=True)
+        self.classifier = nn.Linear(512, 1)
 
     @classmethod
     def from_config(cls, cfg):
@@ -231,5 +235,5 @@ class ResNet3DDepth(nn.Module):
 
     def forward(self, x, **kwargs):
         output = dict()
-        output["predictions"] = self.backbone(x)
+        output["predictions"] = self.classifier(self.backbone(x))
         return output

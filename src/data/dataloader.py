@@ -54,14 +54,14 @@ class CTDataset(TorchDataset):
     def _extract_patches(self, item, idx):
 
         patched = self.grid_patch(item)  # apply GridPatchd
-        print("debug img: ", patched["image"].shape)
-        print("debug seg: ", patched["segmentation"].shape)
+        # print("debug img: ", patched["image"].shape)
+        # print("debug seg: ", patched["segmentation"].shape)
         images = torch.permute(patched["image"].squeeze(2), (1, 0, 2, 3))  # (N, 3, 64, 64) -> (3, N, 64, 64)
 
         segs = torch.permute(patched["segmentation"].squeeze(2), (1, 0, 2, 3))
 
         # Background filter
-        keep = (images.abs() < 0.1).float().mean(dim=(0, 2, 3)) < 0.7
+        keep = (images.abs() < 0.1).float().mean(dim=(0, 2, 3)) < 0.6
 
         item["image"] = images[:, keep].as_tensor()
         item["segmentation"] = segs[:, keep]
@@ -84,11 +84,11 @@ class CTDataset(TorchDataset):
             item["segmentation"] = item["segmentation"][:, :item["original_depth"], :, :]
         item["scan_path"] = self.data[idx]["image"]
 
-        if self.transforms is not None:
-            item = self.transforms(item)
-
         if self.patch_mode:
             item = self._extract_patches(item, idx)
+
+        if self.transforms is not None:
+            item = self.transforms(item)
 
         seg = item["segmentation"]
         # seg shape C,D,H,W
@@ -105,6 +105,7 @@ class NiftiDataModule:
 
     def __init__(self, cfg):
         self.cfg = cfg
+
         self.train_dataset = None
         self.test_dataset = None
 
@@ -131,6 +132,11 @@ class NiftiDataModule:
         self.train_dataset = CTDataset((train_controls, train_cases), get_augmentation_transforms("train"), cfg,
                                        persistent_ds=train_persistent)
         self.test_dataset = CTDataset((test_controls, test_cases), None, cfg, persistent_ds=test_persistent)
+        if len(self.train_dataset) == 0:
+            self.test_eval = True
+        else:
+            self.test_eval = False
+
         self.train_sampler, self.test_sampler = self._build_sampler()
 
     def _collect_data_paths(self, split: str):
@@ -153,11 +159,13 @@ class NiftiDataModule:
                 print("Path: ", path, "cases: ", len(tuh_cases), "controls: ", len(tuh_controls))
 
         if self.cfg.dataloader.kits:
+            split = "*"  # all data goes to test for evaluating
             kits = glob.glob(f"{base}data/imagesTr/{split}/kits_*.nii.gz")
             tumors += kits
             print("Kits cases: ", len(kits))
 
         if self.cfg.dataloader.kirc:
+            split = "*"
             kirc = glob.glob(f"{base}data/imagesTr/{split}/TCGA-*.nii.gz")
             tumors += kirc
             print("Kirc cases: ", len(kirc))
@@ -166,8 +174,28 @@ class NiftiDataModule:
 
     def _build_sampler(self):
 
-        if self.cfg.kits_kirc_eval:
+        if not self.test_eval:
 
+            class_sample_count = [self.train_dataset.controls, self.train_dataset.cases]
+            weights = 1 / torch.Tensor(class_sample_count)
+            samples_weight = np.array([weights[int(t[0])] for t in self.train_dataset.labels])
+            samples_weight = torch.from_numpy(samples_weight)
+            samples_weight = samples_weight.double()
+            sampler = torch.utils.data.sampler.WeightedRandomSampler(samples_weight, len(samples_weight),
+                                                                     replacement=False)
+
+            if self.cfg.distributed:
+                sampler = DistributedSamplerWrapper(sampler=sampler, num_replicas=int(torch.cuda.device_count()),
+                                                    rank=int(os.environ["LOCAL_RANK"]), shuffle=True)
+                sampler_test = DistributedSampler(self.test_dataset, num_replicas=int(torch.cuda.device_count()),
+                                                  rank=int(os.environ["LOCAL_RANK"]),
+                                                  shuffle=True)
+            else:
+                sampler_test = None
+
+            return sampler, sampler_test
+
+        else:
             if self.cfg.distributed:
                 sampler_test = DistributedSampler(self.test_dataset, num_replicas=int(torch.cuda.device_count()),
                                                   rank=int(os.environ["LOCAL_RANK"]),
@@ -175,25 +203,6 @@ class NiftiDataModule:
                 return None, sampler_test
             else:
                 return None, None
-
-        class_sample_count = [self.train_dataset.controls, self.train_dataset.cases]
-        weights = 1 / torch.Tensor(class_sample_count)
-        samples_weight = np.array([weights[int(t[0])] for t in self.train_dataset.labels])
-        samples_weight = torch.from_numpy(samples_weight)
-        samples_weight = samples_weight.double()
-        sampler = torch.utils.data.sampler.WeightedRandomSampler(samples_weight, len(samples_weight),
-                                                                 replacement=False)
-
-        if self.cfg.distributed:
-            sampler = DistributedSamplerWrapper(sampler=sampler, num_replicas=int(torch.cuda.device_count()),
-                                                rank=int(os.environ["LOCAL_RANK"]), shuffle=True)
-            sampler_test = DistributedSampler(self.test_dataset, num_replicas=int(torch.cuda.device_count()),
-                                              rank=int(os.environ["LOCAL_RANK"]),
-                                              shuffle=True)
-        else:
-            sampler_test = None
-
-        return sampler, sampler_test
 
     def _make_loader(self, dataset, sampler, train: bool, shuffle: bool):
         collate_fn = partial(custom_collate, patch_mode=self.cfg.patch_mode)

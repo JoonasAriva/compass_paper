@@ -15,9 +15,6 @@ class DepthLoss(nn.Module):
         N = len(predictions)
         device = predictions.device
 
-        # Predicted pairwise distances: shape (N, N)
-        # pred_dist[i,j] = pred[i] - pred[j]
-
         i, j = torch.tril_indices(N, N, offset=-1, device=device)
 
         pred_dist = predictions[i] - predictions[j]
