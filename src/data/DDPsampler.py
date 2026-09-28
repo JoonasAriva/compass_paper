@@ -1,6 +1,6 @@
 from operator import itemgetter
 from typing import Iterator, Optional
-
+import torch
 from torch.utils.data import Dataset, Sampler
 from torch.utils.data import DistributedSampler
 
@@ -88,3 +88,39 @@ class DistributedSamplerWrapper(DistributedSampler):
         indexes_of_indexes = super().__iter__()
         subsampler_indexes = self.dataset
         return iter(itemgetter(*indexes_of_indexes)(subsampler_indexes))
+
+
+class DistributedBalancedSampler(torch.utils.data.Sampler):
+    """Each epoch: all positives + an equal number of random negatives, shuffled, split across ranks."""
+    def __init__(self, labels, num_replicas, rank, seed=0):
+        labels = torch.as_tensor(labels)
+        self.pos, self.neg = torch.where(labels == 1)[0], torch.where(labels == 0)[0]
+        self.n = min(len(self.pos), len(self.neg))
+        self.num_replicas, self.rank, self.seed, self.epoch = num_replicas, rank, seed, 0
+        self.num_samples = (2 * self.n) // num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)  # same on every rank
+        pos = self.pos[torch.randperm(len(self.pos), generator=g)[: self.n]]
+        neg = self.neg[torch.randperm(len(self.neg), generator=g)[: self.n]]
+        idx = torch.cat([pos, neg])[torch.randperm(2 * self.n, generator=g)]
+        idx = idx[: self.num_samples * self.num_replicas]
+        return iter(idx[self.rank :: self.num_replicas].tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+
+class UnevenDistributedSampler(torch.utils.data.Sampler):
+    """Split a dataset across ranks with no padding: every sample seen exactly once."""
+    def __init__(self, dataset, num_replicas, rank):
+        self.indices = list(range(len(dataset)))[rank::num_replicas]
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)

@@ -45,7 +45,10 @@ def validate_cache(cache_dir: str):
 #     collated["normal_kidney_slices"] = torch.cat(normal_kidney_slices, dim=1)
 #     return collated
 
-def custom_collate(batch, patch_mode=False):
+def custom_collate(batch, patch_mode=False, use_cached_features=False):
+    if use_cached_features:
+        return _collate_cached_features(batch)
+
     images, bag_indexes, slice_classes_list, normal_kidney_slices,segmentations = [], [], [], [], []
 
     for batch_idx, item in enumerate(batch):
@@ -77,6 +80,40 @@ def custom_collate(batch, patch_mode=False):
     collated["bag_index"] = torch.cat(bag_indexes)
 
     return collated
+
+
+def _collate_cached_features(batch):
+    """
+    Same flat-concat-tagged-by-bag_index scheme as the raw-image path, just
+    without the padding/truncation machinery -- cached tensors are already
+    exactly the right (compass-filtered, unpadded) length per scan -- and
+    without pad_list_data_collate, since nothing MONAI-specific is left in
+    the item dict once features/slice_classes/normal_kidney_slices/bag_index
+    are popped, keeping this path free of any MONAI dependency.
+    """
+    features, bag_indexes, slice_classes_list, normal_kidney_slices, scan_paths, classes = [], [], [], [], [], []
+
+    for batch_idx, item in enumerate(batch):
+        feats = item.pop("features")
+        actual_len = feats.shape[0]
+
+        features.append(feats)
+        bag_indexes.append(torch.full((actual_len,), batch_idx, dtype=torch.long))
+        item.pop("bag_index")  # per-scan dataset idx, discarded -- rebuilt above using batch position
+
+        slice_classes_list.append(item.pop("slice_classes"))
+        normal_kidney_slices.append(item.pop("normal_kidney_slices"))
+        scan_paths.append(item.pop("scan_path"))
+        classes.append(item.pop("class"))
+
+    return {
+        "features": torch.cat(features, dim=0),  # (total_N, feat_dim)
+        "slice_classes": torch.cat(slice_classes_list, dim=0),
+        "normal_kidney_slices": torch.cat(normal_kidney_slices, dim=0),
+        "bag_index": torch.cat(bag_indexes),
+        "scan_path": scan_paths,
+        "class": torch.tensor(classes),  # (B,), same key as raw-image path
+    }
 
 
 def make_data_dict(controls, tumors):

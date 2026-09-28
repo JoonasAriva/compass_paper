@@ -1,7 +1,8 @@
 import numpy as np
 import torch
-from torch.distributed import all_reduce, ReduceOp
 from sklearn.metrics import roc_auc_score
+from torch.distributed import all_reduce
+
 
 def gather_array(local_arr):
     """Concatenate a numpy array across all ranks. Handles uneven shard sizes."""
@@ -41,10 +42,12 @@ def reduce_epoch_results(results):
     reduced = all_reduce_sum_dict(results)  # tn, fp, fn, tp, n_samples, [+ slice counts]
 
     out = compute_confusion_metrics(reduced["tn"], reduced["fp"], reduced["fn"], reduced["tp"])
-    out["auc_roc"] = roc_auc_score(labels_global, predictions_global)
+    out["auc_roc"] = (roc_auc_score(labels_global, predictions_global)
+                      if len(np.unique(labels_global)) > 1 else float("nan"))
     out["n_samples"] = reduced["n_samples"]
+    out["pos_frac"] = (reduced["tp"] + reduced["fn"]) / reduced["n_samples"]
 
-    for k,v in reduced.items():
+    for k, v in reduced.items():
         if "loss" in k:
             out[k] = v / torch.distributed.get_world_size()
 

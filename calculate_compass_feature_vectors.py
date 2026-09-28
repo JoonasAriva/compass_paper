@@ -16,12 +16,12 @@ from torch.utils.data import DataLoader
 
 from src.models.compass_2d_resnet import ResNetCompass
 
-model = ResNetCompass(name='resnet18', norm_layer='group', framework="compass", pretrained=None)
-sd = torch.load('/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-06-10/16-44-14/checkpoints/best.pth',
-                map_location='cuda:0', weights_only=True)
-sd = sd["model"]
-new_sd = {key.replace("module.", ""): value for key, value in sd.items()}
-model.load_state_dict(state_dict=new_sd)
+model = ResNetCompass(name='resnet18', norm_layer='group', framework="compass", pretrained='imagenet')
+# sd = torch.load('/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-06-10/16-44-14/checkpoints/best.pth',
+#                 map_location='cuda:0', weights_only=True)
+# sd = sd["model"]
+# new_sd = {key.replace("module.", ""): value for key, value in sd.items()}
+# model.load_state_dict(state_dict=new_sd)
 model.cuda()
 
 from hydra import initialize, compose
@@ -36,7 +36,7 @@ with initialize(config_path="conf", version_base=None):
 datamodule = NiftiDataModule(cfg)
 
 # Where the cached feature tensors + manifests go. Adjust to your scratch layout.
-FEATURE_ROOT = Path("/scratch/project_465002884/2d_slice_compass_features")
+FEATURE_ROOT = Path("/scratch/project_465002884/2d_slice_imagenet_features")
 
 
 def save_scan_features(out_dir, idx, batch, preds, dataset):

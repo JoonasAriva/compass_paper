@@ -116,8 +116,10 @@ class FocusMILClassificationHead(nn.Module):
 @register("resnet50")
 class ResNetCompass(nn.Module):
 
-    def __init__(self, name: str, norm_layer: str = "batch", pretrained: str = 'imagenet', framework: str = 'compass'):
+    def __init__(self, name: str, norm_layer: str = "batch", pretrained: str = 'imagenet', framework: str = 'compass', use_cached_features: bool = False):
         super().__init__()
+
+        self.use_cached_features = use_cached_features
         arch_cfg = CONFIGS[name]
         norm = NORM_LAYERS[norm_layer]
 
@@ -149,14 +151,20 @@ class ResNetCompass(nn.Module):
             name=cfg.model,
             norm_layer=cfg.norm_layer,
             pretrained=cfg.pretrained,
-            framework=cfg.experiment
+            framework=cfg.experiment,
+            use_cached_features=cfg.dataloader.use_cached_features
         )
 
     def forward(self, x, scan_end, training: bool = True, bag_index=None):
         output = defaultdict(int)
 
-        features = self.backbone(x)
-        pooled_feats = self.adaptive_pooling(features)
+        if not self.use_cached_features:
+            features = self.backbone(x)
+            pooled_feats = self.adaptive_pooling(features)
+        else:
+
+            pooled_feats = x
+
         pooled_feats = pooled_feats[:scan_end]
         pooled_feats = pooled_feats.view(-1, 512)
 
@@ -197,7 +205,10 @@ class ResNetCompass(nn.Module):
         elif self.framework == 'FocusMIL':
 
             instance_mu, instance_logvar = self.vae(pooled_feats)
-            instance_std = (instance_logvar * 0.5).exp_()
+            instance_mu = instance_mu.float()
+            instance_logvar = instance_logvar.float().clamp(-10.0, 10.0)
+            instance_std = torch.exp(0.5 * instance_logvar)
+
 
             if training:
                 qzx = dist.Normal(instance_mu, instance_std)
@@ -211,8 +222,8 @@ class ResNetCompass(nn.Module):
             output["instance_std"] = instance_std
 
             KL_loss = 0.5 * (
-                    instance_mu.pow(2) + instance_std.pow(2)
-                    - 2 * torch.log(instance_std + 1e-8) - 1
+                    instance_mu.pow(2) + instance_logvar.exp()
+                    - instance_logvar - 1
             ).mean()
 
             output["KL_loss"] = KL_loss

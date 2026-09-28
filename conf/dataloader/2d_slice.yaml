@@ -16,5 +16,6 @@ depth_crop: 300
 prefetch_factor: 2
 name: 2d_slice
 subsample_slices: True
-
+use_cached_features: False
+features_dir: None #/scratch/project_465002884/2d_slice_imagenet_features #/scratch/project_465002884/2d_slice_compass_features
 cache_dir: /scratch/project_465002884/monai_cache/${dataloader.name}/sp${dataloader.spacing[0]}_${dataloader.spacing[1]}_crop${dataloader.depth_crop}_ax${dataloader.axial_crop}

@@ -1,6 +1,7 @@
 import glob
 import os
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -10,18 +11,24 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data.distributed import DistributedSampler
 
-from src.data.DDPsampler import DistributedSamplerWrapper
+from src.data.DDPsampler import DistributedBalancedSampler, UnevenDistributedSampler
 from src.data.dataloader_utils import custom_collate, make_data_dict
 from src.data.transforms import get_deterministic_transforms, get_augmentation_transforms
 from src.training.compass_filter import CompassFilter
 
 
 class CTDataset(TorchDataset):
-    def __init__(self, data_paths, transforms, cfg, persistent_ds=None):
+    def __init__(self, data_paths, transforms, cfg, persistent_ds=None, features_dir=None):
         controls, tumors = data_paths
         self.transforms = transforms
         self.cfg = cfg
         self.patch_mode = cfg.patch_mode
+
+        # features_dir is None -> original raw-image behaviour, unchanged.
+        # features_dir is set  -> load pre-extracted tensors instead.
+        self.use_cached_features = features_dir is not None
+        self.features_dir = features_dir
+
         data_dict = make_data_dict(controls, tumors)
         self.data = data_dict
 
@@ -34,15 +41,25 @@ class CTDataset(TorchDataset):
         self.img_paths = controls + tumors
         self.labels = control_labels + tumor_labels
 
-        self.monai_pipeline = persistent_ds if persistent_ds is not None else MonaiDataset(data=data_dict,
-                                                                                           transform=transforms)
-
         if cfg.compass_filter == True:
             train_path = '/users/arivajoo/compass_paper/train_set_compass_scores_2d_slice_vol2.csv'
             test_path = '/users/arivajoo/compass_paper/test_set_compass_scores_joined_tuh_kits_kirc_2d_slice.csv'
             self.compass_filter = CompassFilter(df_train_path=train_path, df_test_path=test_path)
         else:
             self.compass_filter = None
+
+        # Nothing below this point (MONAI pipeline or
+        # patch grid) is needed once features are pre-extracted -- all of
+        # that already ran once at extraction time. img_paths/labels above
+        # are still needed since the sampler and _get_cached_item both use
+        # them.
+        if self.use_cached_features:
+            self.monai_pipeline = None
+            self.grid_patch = None
+            return
+
+        self.monai_pipeline = persistent_ds if persistent_ds is not None else MonaiDataset(data=data_dict,
+                                                                                           transform=transforms)
 
         self.grid_patch = GridPatchd(
             keys=["image", "segmentation"],
@@ -72,6 +89,10 @@ class CTDataset(TorchDataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+
+        if self.use_cached_features:
+            return self._get_cached_item(idx)  # for frozen feature vectors
+
         item = self.monai_pipeline[idx]  # dim order: C,D,H,W
 
         if self.compass_filter:
@@ -100,11 +121,63 @@ class CTDataset(TorchDataset):
         item["bag_index"] = torch.full((num_slices,), idx, dtype=torch.long)  # each slice tagged with scan idx
         return item
 
+    def _get_cached_item(self, idx):
+        """
+        Mirrors the item schema of the raw-image path as closely as possible
+        (slice_classes, normal_kidney_slices, bag_index all present) -- only
+        "image" is replaced by "features", and there's no "segmentation"
+        since the pixel-level mask isn't meaningful once you're past a
+        frozen backbone. Whatever consumes the batch downstream needs to
+        branch on this same use_cached_features flag to know whether to run
+        the backbone (raw mode) or use "features" directly (cached mode).
+
+        IMPORTANT: this assumes features were extracted with compass_filter
+        OFF, so the cached tensor spans the full original_depth range in
+        original slice order, starting at index 0. Compass filtering is then
+        applied here as a slice on the cached tensor, using the exact same
+        start_idx/end_idx semantics as the raw-image path. If compass_filter
+        was ON during extraction, the cache is already pre-filtered to a
+        different range, and re-applying it here will slice into the wrong
+        indices -- re-run extraction with compass_filter disabled first.
+        """
+        scan_path = self.img_paths[idx]
+        stem = Path(scan_path).name.replace(".nii.gz", "").replace(".nii", "")
+        cache_path = Path(self.features_dir) / f"{stem}.pt"
+        # weights_only=False: these caches carry MONAI MetaTensor objects
+        # (extra tracking metadata) that PyTorch 2.6+'s default weights_only
+        # unpickler doesn't allowlist. Safe here since these are files you
+        # generated yourself on your own scratch storage, not third-party
+        # checkpoints.
+        cached = torch.load(cache_path, weights_only=False)
+
+        features = cached["features"]
+        slice_classes = cached["slice_classes"]
+        normal_kidney_slices = cached["normal_kidney_slices"]
+
+        if self.compass_filter is not None:
+            start_idx, end_idx = self.compass_filter.get_indexes(case_id=scan_path)
+            if start_idx is not None and end_idx > start_idx:
+                features = features[start_idx:end_idx]
+                slice_classes = slice_classes[start_idx:end_idx]
+                normal_kidney_slices = normal_kidney_slices[start_idx:end_idx]
+
+        num_instances = features.shape[0]
+        return {
+            "features": features,  # (N, feat_dim)
+            "slice_classes": slice_classes,
+            "normal_kidney_slices": normal_kidney_slices,
+            "scan_path": cached["scan_path"],
+            "class": cached["label"],  # same source as self.labels[idx][0]
+            "bag_index": torch.full((num_instances,), idx, dtype=torch.long),
+        }
+
 
 class NiftiDataModule:
 
     def __init__(self, cfg):
         self.cfg = cfg
+
+        self.use_cached_features = cfg.dataloader.use_cached_features
 
         self.train_dataset = None
         self.test_dataset = None
@@ -112,26 +185,41 @@ class NiftiDataModule:
         train_controls, train_cases = self._collect_data_paths("train")
         test_controls, test_cases = self._collect_data_paths("test")
 
-        cache_dir = cfg.dataloader.cache_dir
-        det_transforms = get_deterministic_transforms(cfg)
+        if self.use_cached_features:
+            # No raw NIfTI / MONAI cache dir needed at all in this mode --
+            # compass filtering, patch extraction, and deterministic
+            # preprocessing already happened once at extraction time.
+            features_dir = cfg.dataloader.features_dir
+            self.train_dataset = CTDataset(
+                (train_controls, train_cases), transforms=None, cfg=cfg,
+                features_dir=f"{features_dir}/train",
+            )
+            self.test_dataset = CTDataset(
+                (test_controls, test_cases), transforms=None, cfg=cfg,
+                features_dir=f"{features_dir}/test",
+            )
+        else:
 
-        # validate_cache(f"{cache_dir}/train")
-        # validate_cache(f"{cache_dir}/test")
+            cache_dir = cfg.dataloader.cache_dir
+            det_transforms = get_deterministic_transforms(cfg)
 
-        train_persistent = PersistentDataset(
-            data=make_data_dict(train_controls, train_cases),
-            transform=det_transforms,
-            cache_dir=f"{cache_dir}/train",
-        )
-        test_persistent = PersistentDataset(
-            data=make_data_dict(test_controls, test_cases),
-            transform=det_transforms,
-            cache_dir=f"{cache_dir}/test",
-        )
+            # validate_cache(f"{cache_dir}/train")
+            # validate_cache(f"{cache_dir}/test")
 
-        self.train_dataset = CTDataset((train_controls, train_cases), get_augmentation_transforms("train"), cfg,
-                                       persistent_ds=train_persistent)
-        self.test_dataset = CTDataset((test_controls, test_cases), None, cfg, persistent_ds=test_persistent)
+            train_persistent = PersistentDataset(
+                data=make_data_dict(train_controls, train_cases),
+                transform=det_transforms,
+                cache_dir=f"{cache_dir}/train",
+            )
+            test_persistent = PersistentDataset(
+                data=make_data_dict(test_controls, test_cases),
+                transform=det_transforms,
+                cache_dir=f"{cache_dir}/test",
+            )
+
+            self.train_dataset = CTDataset((train_controls, train_cases), get_augmentation_transforms("train"), cfg,
+                                           persistent_ds=train_persistent)
+            self.test_dataset = CTDataset((test_controls, test_cases), None, cfg, persistent_ds=test_persistent)
         if len(self.train_dataset) == 0:
             self.test_eval = True
         else:
@@ -173,39 +261,27 @@ class NiftiDataModule:
         return controls, tumors
 
     def _build_sampler(self):
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        rank = int(os.environ.get("RANK", 0))
 
-        if not self.test_eval:
-
-            class_sample_count = [self.train_dataset.controls, self.train_dataset.cases]
-            weights = 1 / torch.Tensor(class_sample_count)
-            samples_weight = np.array([weights[int(t[0])] for t in self.train_dataset.labels])
-            samples_weight = torch.from_numpy(samples_weight)
-            samples_weight = samples_weight.double()
-            sampler = torch.utils.data.sampler.WeightedRandomSampler(samples_weight, len(samples_weight),
-                                                                     replacement=False)
-
+        if self.test_eval:
             if self.cfg.distributed:
-                sampler = DistributedSamplerWrapper(sampler=sampler, num_replicas=int(torch.cuda.device_count()),
-                                                    rank=int(os.environ["LOCAL_RANK"]), shuffle=True)
-                sampler_test = DistributedSampler(self.test_dataset, num_replicas=int(torch.cuda.device_count()),
-                                                  rank=int(os.environ["LOCAL_RANK"]),
-                                                  shuffle=True)
-            else:
-                sampler_test = None
+                return None, DistributedSampler(self.test_dataset, num_replicas=world_size,
+                                                rank=rank, shuffle=False)
+            return None, None
 
-            return sampler, sampler_test
-
-        else:
-            if self.cfg.distributed:
-                sampler_test = DistributedSampler(self.test_dataset, num_replicas=int(torch.cuda.device_count()),
-                                                  rank=int(os.environ["LOCAL_RANK"]),
-                                                  shuffle=True)
-                return None, sampler_test
-            else:
-                return None, None
+        sampler = DistributedBalancedSampler(
+            labels=[int(l[0]) for l in self.train_dataset.labels],
+            num_replicas=world_size if self.cfg.distributed else 1,
+            rank=rank if self.cfg.distributed else 0,
+            seed=self.cfg.seed,
+        )
+        sampler_test = UnevenDistributedSampler(self.test_dataset, num_replicas=world_size, rank=rank) if self.cfg.distributed else None
+        return sampler, sampler_test
 
     def _make_loader(self, dataset, sampler, train: bool, shuffle: bool):
-        collate_fn = partial(custom_collate, patch_mode=self.cfg.patch_mode)
+        collate_fn = partial(custom_collate, patch_mode=self.cfg.patch_mode,
+                             use_cached_features=self.cfg.dataloader.use_cached_features)
         return DataLoader(
             dataset,
             batch_size=self.cfg.dataloader.batch_size,
@@ -216,7 +292,8 @@ class NiftiDataModule:
             prefetch_factor=self.cfg.dataloader.prefetch_factor,
             sampler=sampler,
             collate_fn=collate_fn,
-            generator=torch.Generator().manual_seed(self.cfg.seed)
+            generator=torch.Generator().manual_seed(self.cfg.seed + int(os.environ.get("LOCAL_RANK", 0))),
+            worker_init_fn=worker_init_fn,
         )
 
     def train_loader(self):
@@ -225,3 +302,14 @@ class NiftiDataModule:
     def test_loader(self):
         return self._make_loader(self.test_dataset, sampler=self.test_sampler, train=False,
                                  shuffle=self.cfg.notebook_eval)
+
+
+import random
+import monai
+
+
+def worker_init_fn(worker_id):
+    base = torch.initial_seed() % 2 ** 32  # already unique per worker
+    np.random.seed(base)
+    random.seed(base)
+    monai.utils.set_determinism(seed=base)

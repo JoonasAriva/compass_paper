@@ -76,17 +76,19 @@ class Trainer:
                                   settings=wandb.Settings(init_timeout=120),
                                   config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
 
-            wandb.define_metric("f1_test", summary="max")
-            wandb.define_metric("accuracy_test", summary="max")
-            wandb.define_metric("f1_train", summary="max")
-            wandb.define_metric("loss_test", summary="min")
-            wandb.define_metric("loss_train", summary="min")
-            wandb.define_metric("bce_loss_test", summary="min")
-            wandb.define_metric("bce_loss_train", summary="min")
+            wandb.define_metric("f1_test", summary="max,last")
+            wandb.define_metric("accuracy_test", summary="max,last")
+            wandb.define_metric("f1_train", summary="max,last")
+            wandb.define_metric("loss_test", summary="min,last")
+            wandb.define_metric("loss_train", summary="min,last")
+            wandb.define_metric("bce_loss_test", summary="min,last")
+            wandb.define_metric("bce_loss_train", summary="min,last")
 
     def _build_scheduler(self, train_cases, train_controls):
-        steps_in_epoch = 2 * min(train_cases, train_controls)
-        total_steps = self.cfg.epochs * steps_in_epoch
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        micro_steps = (2 * min(train_cases, train_controls)) // world_size // self.cfg.dataloader.batch_size
+        steps_per_epoch = math.ceil(micro_steps / self.cfg.grad_accumulation_steps)
+        total_steps = self.cfg.epochs * steps_per_epoch
         warmup_steps = int(0.1 * total_steps)  # 10% warmup
 
         def lr_lambda(step):
@@ -141,10 +143,7 @@ class Trainer:
                     new_no_decay.append(p)
                 else:
                     new_decay.append(p)
-        # print("backbone decay: ",backbone_decay)
-        # print("backbone no decay: ",backbone_no_decay)
-        # print("new decay: ",new_decay)
-        # print("new no decay: ",new_no_decay)
+
         # Optimizer with separate LR and proper weight decay
         optimizer = optim.AdamW([
             # Backbone (usually pretrained)
@@ -199,26 +198,48 @@ class Trainer:
         slice_outputs = []
         slice_targets = []
 
+        accumulation_steps = self.cfg.grad_accumulation_steps if train else 1
+        pending_update = False
+
+        def _optimizer_step():
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scheduler.step()
+            self.global_steps += 1
+
         data_loading_time = time.time()
         full_loop_time = time.time()
         process = psutil.Process()
+
+        if train:
+            self.optimizer.zero_grad(set_to_none=True)
+
         with ctx:
             for batch in tepoch:
-                self.optimizer.zero_grad(set_to_none=True)
+
                 data_times.append(time.time() - data_loading_time)
-                scans = torch.squeeze(batch["image"]).to(self.device, non_blocking=True)  # (C, total_D, H, W)
-                if self.cfg.mode == "2D":
-                    scans = torch.permute(scans, (1, 0, 2, 3))  # C,D,H,W --> D,C,H,W
 
-                elif self.cfg.mode == "3D":
-                    scans = torch.unsqueeze(torch.unsqueeze(scans[1], dim=0), dim=0)
-                    # scans = torch.unsqueeze(torch.unsqueeze(scans, dim=0), dim=0)
-                labels = batch["class"].to(self.device, non_blocking=True).view(-1, 1).float()  # [B]->[B,1]
-
-                if self.cfg.dataloader.batch_size == 1 and self.cfg.compass_filter == False:
-                    scan_end = batch["original_depth"].item()
-                else:  # no padding
+                if self.cfg.dataloader.use_cached_features:
+                    # (total_N, feat_dim) -- already instance-major, no channel dim
+                    # to permute, and no padding to account for (cached tensors are
+                    # always the real, compass-filtered length, so scan_end is just
+                    # the total count -- same as the raw path's "no padding" case).
+                    scans = batch["features"].to(self.device, non_blocking=True)
                     scan_end = scans.shape[0]
+                else:
+                    scans = torch.squeeze(batch["image"]).to(self.device, non_blocking=True)  # (C, total_D, H, W)
+                    if self.cfg.mode == "2D":
+                        scans = torch.permute(scans, (1, 0, 2, 3))  # C,D,H,W --> D,C,H,W
+
+                    elif self.cfg.mode == "3D":
+                        scans = torch.unsqueeze(torch.unsqueeze(scans[1], dim=0), dim=0)
+                        # scans = torch.unsqueeze(torch.unsqueeze(scans, dim=0), dim=0)
+                    if self.cfg.dataloader.batch_size == 1 and self.cfg.compass_filter == False:
+                        scan_end = batch["original_depth"].item()
+                    else:  # no padding
+                        scan_end = scans.shape[0]
+                labels = batch["class"].to(self.device, non_blocking=True).view(-1, 1).float()  # [B]->[B,1]
                 bag_index = batch["bag_index"].to(self.device, non_blocking=True)
 
                 if self.cfg.check:
@@ -285,16 +306,13 @@ class Trainer:
 
                 if train:
                     backprop_time = time.time()
-                    self.scaler.scale(loss["total_loss"]).backward()
+                    self.scaler.scale(loss["total_loss"]/accumulation_steps).backward()
+                    pending_update = True
                     backprop_times.append(time.time() - backprop_time)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
 
-                    if self.global_steps < self.warmup_steps:
-                        # Linear warmup
-                        scale = (self.global_steps + 1) / float(max(1, self.warmup_steps))
-                        for g in self.optimizer.param_groups:
-                            g['lr'] = g['initial_lr'] * scale
+                    if (step + 1) % accumulation_steps == 0:
+                        _optimizer_step()
+                        pending_update = False
 
                     if len(backprop_times) % 100 == 0:
                         self._print(f"batch {len(backprop_times)} backward: {backprop_times[-1]:.3f}s "
@@ -303,13 +321,11 @@ class Trainer:
                     self._print(f"Batch {step} CPU RAM: {process.memory_info().rss / 1e9:.2f} GB")
 
                 results["loss"] += loss["total_loss"].item()
-
                 # results["depth_loss"] += loss["depth_loss"].item()
 
                 del loss, output
 
                 step += 1
-                self.global_steps += 1
 
                 full_loop_times.append(time.time() - full_loop_time)
                 if len(full_loop_times) % 20 == 0:
@@ -318,10 +334,12 @@ class Trainer:
                 full_loop_time = time.time()
                 data_loading_time = time.time()
 
-                if train and step >= total_steps:
-                    break
                 if step >= 3 and self.cfg.check:
                     break
+
+            if train and pending_update:
+                _optimizer_step()
+
         for key, value in results.items():
             results[key] = value / step
 
@@ -344,12 +362,6 @@ class Trainer:
             results["labels"] = targets
             results["predictions"] = probs
 
-            # specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-            # results["specificity"] = specificity
-            # results["precision"] = precision_score(targets, outputs, average='binary')
-            # results["recall"] = recall_score(targets, outputs, average='binary')
-            # results["accuracy"] = accuracy_score(targets, outputs)
-
             if self.cfg.mode == "2D":
                 slice_outputs_flat = np.concatenate(slice_outputs)
                 slice_targets_flat = np.concatenate(slice_targets)
@@ -362,11 +374,6 @@ class Trainer:
                 results["fn_slice"] = fn_slice
                 results["tp_slice"] = tp_slice
                 results["n_slice_samples"] = len(slice_outputs_flat)
-
-                # results["slice_f1"] = f1_score(slice_targets_flat, slice_outputs_flat, average='macro', zero_division=0)
-                # results["slice_precision"] = precision_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
-                # results["slice_recall"] = recall_score(slice_targets_flat, slice_outputs_flat, zero_division=0)
-                # results["slice_accuracy"] = accuracy_score(slice_targets_flat, slice_outputs_flat)
 
         self._print(f"Rank {self.local_rank} - Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         self._print(f"Rank {self.local_rank} - Max memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
@@ -421,12 +428,14 @@ class Trainer:
             start_epoch = self._load_checkpoint() + 1
             self._print(f"Resuming from epoch {start_epoch}")
 
-        gpu_count = torch.cuda.device_count()
-        train_steps_in_epoch = (2 * min(self.datamodule.train_dataset.cases,
-                                        self.datamodule.train_dataset.controls)) // gpu_count // self.cfg.dataloader.batch_size
+        train_steps_in_epoch = len(train_loader)
 
         process = psutil.Process()
         for epoch in range(start_epoch, self.cfg.epochs):
+
+            sampler = self.datamodule.train_sampler
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
 
             self._print(f"Starting epoch {epoch}")
 
@@ -457,11 +466,12 @@ class Trainer:
                 return
 
             if self.is_main_process:
+                epoch_results["lr"] = self.optimizer.param_groups[0]["lr"]
                 self.run.log(epoch_results)
 
             self._print(f"====================LOSS VALUES=========================")
             self._print(
-                f"train loss: {epoch_results['loss_test']}, test loss: {epoch_results['loss_test']} at epoch {epoch}")
+                f"test loss: {epoch_results['loss_test']}, train loss: {epoch_results['loss_train']} at epoch {epoch}")
             t = time.time()
             if epoch_results["loss_test"] < best_test_loss:
                 best_test_loss = epoch_results["loss_test"]
@@ -470,10 +480,10 @@ class Trainer:
             if epoch_results["f1_test"] > best_f1:
                 best_f1 = epoch_results["f1_test"]
                 self._print(f"Best test f1 achieved {best_f1} at epoch {epoch}!")
-                self._save_checkpoint("best_f1.pth", epoch=epoch, save_path=True)
-            else:
+                self._save_checkpoint("best_f1.pth", epoch=epoch)
 
-                self._save_checkpoint("current.pth", epoch=epoch)
+
+            self._save_checkpoint("current.pth", epoch=epoch, save_path=True)
             self._print(f"saving checkpoint took {time.time() - t:.1f}s")
 
             gc.collect()
@@ -483,7 +493,9 @@ class Trainer:
 
         metrics = compute_confusion_metrics(results_dict["tn"], results_dict["fp"], results_dict["fn"],
                                             results_dict["tp"])
-        metrics["auc_roc"] = roc_auc_score(results_dict["labels"], results_dict["predictions"])
+
+        metrics["auc_roc"] = (roc_auc_score(results_dict["labels"], results_dict["predictions"])
+                  if len(np.unique(results_dict["labels"])) > 1 else float("nan"))
         metrics["n_samples"] = results_dict["n_samples"]
         for k, v in results_dict.items():
             if "loss" in k:
@@ -497,7 +509,7 @@ class Trainer:
             for k, v in slice_metrics.items():
                 metrics[f"{k}_slice"] = v
             metrics["n_samples_slice"] = results_dict["n_slice_samples"]
-
+        metrics["pos_frac"] = (results_dict["tp"] + results_dict["fn"]) / results_dict["n_samples"]
         return metrics
 
     def eval(self):
