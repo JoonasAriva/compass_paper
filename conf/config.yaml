@@ -5,25 +5,26 @@ hydra:
 defaults:
   - dataloader/2d_slice #dataloader/3d_scan or /2d_slice
 
-experiment: ABMIL #ABMIL, compass, FocusMIL and now 3D
+experiment: FocusMIL #ABMIL, compass, FocusMIL and now 3D
 model: resnet18 #_3D
 norm_layer: group
 pretrained: compass # imagenet/compass
-compass_filter : True
+compass_filter : False
 distributed: False
 
 loss: bce #bce/depth
 loss_kwargs: {}
 
-epochs: 150
-grad_accumulation_steps: 5
+epochs: 200
+grad_accumulation_steps: 1
 weight_decay: 5e-4
 patch_mode: False
 mode: 2D #3D, 2D
 
 negative_instance_supervision: False
 
-checkpoint_path: null
+checkpoint_path: /scratch/project_465002884/results/FocusMIL/resnet18/2d_slice/2026-10-06/22-22-58/checkpoints/current.pth #focus mil no filter
+# abmil no filter: /scratch/project_465002884/results/ABMIL/resnet18/2d_slice/2026-10-06/17-45-21checkpoints/current.pth
 notebook_eval: False
 seed: 42 #42 52 62
 

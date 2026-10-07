@@ -43,7 +43,7 @@ def load_pretrained(model, name):
 
 def load_compass_trained(model):
     sd = torch.load(
-        '/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-06-10/16-44-14/checkpoints/best.pth',
+        '/scratch/project_465002884/results/compass/resnet18/2d_slice/2026-09-30/12-37-49/checkpoints/current.pth',
         map_location='cuda:0', weights_only=True)
     sd = sd["model"]
     new_sd = {key.replace("module.", ""): value for key, value in sd.items()}

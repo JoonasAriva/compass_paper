@@ -14,7 +14,7 @@ import psutil
 import torch
 import torch.optim as optim
 import wandb
-from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.metrics import confusion_matrix
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
@@ -22,7 +22,7 @@ from tqdm import tqdm
 from src.data.dataloader import NiftiDataModule
 from src.models import build_model
 from src.training.losses import build_loss
-from src.training.metrics import reduce_epoch_results, compute_confusion_metrics
+from src.training.metrics import reduce_epoch_results, single_gpu_compute_metrics
 
 sys.path.append('/users/arivajoo/GPAI')
 from omegaconf import OmegaConf
@@ -62,14 +62,12 @@ class Trainer:
         self.scaler = torch.amp.GradScaler()
         self.loss_function = build_loss(cfg)
 
-        train_cases = self.datamodule.train_dataset.cases
-        train_controls = self.datamodule.train_dataset.controls
-
-        self.scheduler = self._build_scheduler(train_cases, train_controls)
+        self.scheduler = self._build_scheduler()
 
         self.global_steps = 0
 
         self._print(OmegaConf.to_yaml(cfg))
+        self.threshold = 0.5
 
         if not cfg.check and self.is_main_process:
             self.run = wandb.init(project="paper", anonymous='must',
@@ -83,13 +81,16 @@ class Trainer:
             wandb.define_metric("loss_train", summary="min,last")
             wandb.define_metric("bce_loss_test", summary="min,last")
             wandb.define_metric("bce_loss_train", summary="min,last")
+            wandb.define_metric("auc_roc_val", summary="max,last")
+            wandb.define_metric("auc_roc_test", summary="max,last")
+            wandb.define_metric("auc_roc_slice_test", summary="max,last")
+            wandb.define_metric("auc_roc_slice_perscan_test", summary="max,last")
 
-    def _build_scheduler(self, train_cases, train_controls):
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        micro_steps = (2 * min(train_cases, train_controls)) // world_size // self.cfg.dataloader.batch_size
+    def _build_scheduler(self):
+        micro_steps = math.ceil(len(self.datamodule.train_sampler) / self.cfg.dataloader.batch_size)
         steps_per_epoch = math.ceil(micro_steps / self.cfg.grad_accumulation_steps)
         total_steps = self.cfg.epochs * steps_per_epoch
-        warmup_steps = int(0.1 * total_steps)  # 10% warmup
+        warmup_steps = int(0.1 * total_steps)
 
         def lr_lambda(step):
             if warmup_steps > 0 and step < warmup_steps:
@@ -197,6 +198,11 @@ class Trainer:
         probs = []
         slice_outputs = []
         slice_targets = []
+        slice_probs = []
+        slice_bags = []
+
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
         accumulation_steps = self.cfg.grad_accumulation_steps if train else 1
         pending_update = False
@@ -285,7 +291,7 @@ class Trainer:
 
                     results["bce_loss"] += loss["bce_loss"].item()
                     probability = torch.sigmoid(output["predictions"])
-                    Y_hat = probability > 0.5
+                    Y_hat = probability > self.threshold  # starts at 0.5
 
                     probs.append(probability.detach().cpu())
                     outputs.append(Y_hat.detach().cpu())
@@ -294,19 +300,24 @@ class Trainer:
                     if self.cfg.mode == "2D":
                         individual_predictions = output["instance_scores"]
 
-                        logit_class = (individual_predictions > 0.05).cpu().numpy().flatten().astype(int)
+                        logit_class = (individual_predictions > 0).cpu().numpy().flatten().astype(int)
 
                         slice_outputs.append(logit_class)
                         slice_targets.append(batch["slice_classes"].numpy().flatten().astype(int))
+                        slice_probs.append(individual_predictions.detach().float().cpu().numpy().flatten())
+                        slice_bags.append(np.full(len(logit_class), step * _world + _rank, dtype=np.int64))
 
                         if self.cfg.check:
                             print("slice predictions: ", len(individual_predictions))
                             print("debug: ", batch["slice_classes"].shape)
                             print("slice classes: ", len(batch["slice_classes"].numpy().flatten().astype(int)))
+                            assert len(logit_class) == len(batch["slice_classes"].numpy().flatten()) == len(
+                                slice_bags[-1]), \
+                                (len(logit_class), batch["slice_classes"].shape, len(slice_bags[-1]))
 
                 if train:
                     backprop_time = time.time()
-                    self.scaler.scale(loss["total_loss"]/accumulation_steps).backward()
+                    self.scaler.scale(loss["total_loss"] / accumulation_steps).backward()
                     pending_update = True
                     backprop_times.append(time.time() - backprop_time)
 
@@ -375,6 +386,10 @@ class Trainer:
                 results["tp_slice"] = tp_slice
                 results["n_slice_samples"] = len(slice_outputs_flat)
 
+                results["slice_labels"] = slice_targets_flat
+                results["slice_predictions"] = np.concatenate(slice_probs)
+                results["slice_bag_index"] = np.concatenate(slice_bags)
+
         self._print(f"Rank {self.local_rank} - Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         self._print(f"Rank {self.local_rank} - Max memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
@@ -383,24 +398,28 @@ class Trainer:
 
         return results
 
-    def _save_checkpoint(self, name, epoch, save_path=False):
-
+    def _save_checkpoint(self, name, epoch, save_path=False, extra=None):
         dir_checkpoint = Path('./checkpoints/')
         if self.is_main_process:
             dir_checkpoint.mkdir(parents=True, exist_ok=True)
-
-            torch.save({
+            payload = {
                 "epoch": epoch,
                 "model": getattr(self.model, "module", self.model).state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
-            }, f"{dir_checkpoint}/{name}")
+                "threshold": 0.5,
+            }
+            if extra:
+                payload.update(extra)
+            torch.save(payload, f"{dir_checkpoint}/{name}")
         if save_path:
             self.cfg.checkpoint_path = f"{dir_checkpoint}/{name}"
 
     def _load_checkpoint(self):
         ckpt = torch.load(self.cfg.checkpoint_path, map_location=self.device)
         getattr(self.model, "module", self.model).load_state_dict(ckpt["model"])
+        self.threshold = ckpt.get("threshold", 0.5)
+        self._print(f"Resumed from checkpoint: {self.cfg.checkpoint_path} (threshold {self.threshold:.3f})")
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
         # self.scaler.load_state_dict(ckpt["scaler"])
@@ -415,13 +434,21 @@ class Trainer:
     def is_main_process(self):
         return not self.cfg.distributed or torch.distributed.get_rank() == 0
 
+    def _metrics(self, results):
+        if torch.distributed.is_initialized():
+            return reduce_epoch_results(results)
+        return single_gpu_compute_metrics(self.cfg, results)
+
     def fit(self):
 
         best_test_loss = float("inf")
         best_f1 = -1
+        best_auc_score = -1
         start_epoch = 0
 
         train_loader = self.datamodule.train_loader()
+        val_loader = self.datamodule.val_loader()
+        print("val loader:", val_loader)
         test_loader = self.datamodule.test_loader()
 
         if self.cfg.checkpoint_path:
@@ -446,20 +473,19 @@ class Trainer:
             ctypes.CDLL("libc.so.6").malloc_trim(0)  # forces glibc to return memory to OS
             self._print(f"CPU RAM after malloc trim: {process.memory_info().rss / 1e9:.2f} GB")
 
-            test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
-            self._print(f"CPU RAM after test: {process.memory_info().rss / 1e9:.2f} GB")
-
-            if torch.distributed.is_initialized():
-                train_metrics = reduce_epoch_results(train_results)
-                test_metrics = reduce_epoch_results(test_results)
-
-            else:
-                train_metrics = self.single_gpu_compute_metrics(train_results)
-                test_metrics = self.single_gpu_compute_metrics(test_results)
+            # test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
 
             epoch_results = {}
-            epoch_results.update({f"{k}_train": v for k, v in train_metrics.items()})
-            epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
+            epoch_results.update({f"{k}_train": v for k, v in self._metrics(train_results).items()})
+
+            if val_loader is not None:
+                self._print("Validating!")
+                val_results = self._run_epoch(self.model, val_loader, len(val_loader), train=False)
+                epoch_results.update({f"{k}_val": v for k, v in self._metrics(val_results).items()})
+
+            if self.cfg.dataloader.eval_test_every_epoch:
+                test_results = self._run_epoch(self.model, test_loader, len(test_loader), train=False)
+                epoch_results.update({f"{k}_test": v for k, v in self._metrics(test_results).items()})
 
             if self.cfg.check:
                 self._print("Model check completed")
@@ -469,106 +495,98 @@ class Trainer:
                 epoch_results["lr"] = self.optimizer.param_groups[0]["lr"]
                 self.run.log(epoch_results)
 
-            self._print(f"====================LOSS VALUES=========================")
-            self._print(
-                f"test loss: {epoch_results['loss_test']}, train loss: {epoch_results['loss_train']} at epoch {epoch}")
             t = time.time()
-            if epoch_results["loss_test"] < best_test_loss:
-                best_test_loss = epoch_results["loss_test"]
-                self._print(f"Best test loss achieved {best_test_loss} at epoch {epoch}!")
-                self._save_checkpoint("best_loss.pth", epoch=epoch)
-            if epoch_results["f1_test"] > best_f1:
-                best_f1 = epoch_results["f1_test"]
-                self._print(f"Best test f1 achieved {best_f1} at epoch {epoch}!")
-                self._save_checkpoint("best_f1.pth", epoch=epoch)
+            self._print(f"====================LOSS VALUES=========================")
+            if val_loader is not None:
+                self._print(
+                    f"val loss: {epoch_results['loss_val']}, train loss: {epoch_results['loss_train']} at epoch {epoch}")
+                if epoch_results["loss_val"] < best_test_loss:
+                    best_test_loss = epoch_results["loss_val"]
+                    self._print(f"Best val loss achieved {best_test_loss} at epoch {epoch}!")
+                    self._save_checkpoint("best_loss.pth", epoch=epoch)
 
+            else:
+                self._print(f"train loss: {epoch_results['loss_train']} at epoch {epoch}")
+            if self.cfg.loss == "bce" and val_loader is not None:
+                score = epoch_results["auc_roc_val"]
+                if score > best_auc_score:
+                    best_auc_score = score
+                    self._print(f"Best val auc roc: {best_auc_score} at epoch {epoch}")
+                    self._save_checkpoint("best_val.pth", epoch=epoch, save_path=True,
+                                          extra={"threshold": epoch_results["thr_val"]})
 
-            self._save_checkpoint("current.pth", epoch=epoch, save_path=True)
+            self._save_checkpoint("current.pth", epoch=epoch, save_path=True)  # if self.cfg.loss != "bce" else False)
             self._print(f"saving checkpoint took {time.time() - t:.1f}s")
 
             gc.collect()
             torch.cuda.empty_cache()
 
-    def single_gpu_compute_metrics(self, results_dict):
-
-        metrics = compute_confusion_metrics(results_dict["tn"], results_dict["fp"], results_dict["fn"],
-                                            results_dict["tp"])
-
-        metrics["auc_roc"] = (roc_auc_score(results_dict["labels"], results_dict["predictions"])
-                  if len(np.unique(results_dict["labels"])) > 1 else float("nan"))
-        metrics["n_samples"] = results_dict["n_samples"]
-        for k, v in results_dict.items():
-            if "loss" in k:
-                metrics[k] = v
-
-        if self.cfg.mode == "2D":
-            slice_metrics = compute_confusion_metrics(
-                results_dict["tn_slice"], results_dict["fp_slice"],
-                results_dict["fn_slice"], results_dict["tp_slice"]
-            )
-            for k, v in slice_metrics.items():
-                metrics[f"{k}_slice"] = v
-            metrics["n_samples_slice"] = results_dict["n_slice_samples"]
-        metrics["pos_frac"] = (results_dict["tp"] + results_dict["fn"]) / results_dict["n_samples"]
-        return metrics
-
     def eval(self):
         # for kits and/or Kirc
-        self._print("Start evaluation on KITS and KIRC")
-        self.cfg.dataloader.kits = True
-        self.cfg.dataloader.kirc = False
-        self.cfg.dataloader.tuh = False
-        self.cfg.dataloader.tuh_extra_data = False
+        collected = {}
+        def _build_and_eval_single_dataset(dataset_name):
+            self.datamodule = NiftiDataModule(self.cfg)
+            test_loader = self.datamodule.test_loader()
 
-        self.datamodule = NiftiDataModule(self.cfg)
-        test_loader = self.datamodule.test_loader()
+            test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
+            test_metrics = self._metrics(test_results)
 
+            epoch_results = {}
+            epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
+
+            if self.is_main_process and getattr(self, "run", None) is not None:
+                self.run.summary.update({
+                    f"final/{dataset_name}/{k.replace('_test', '')}": (v.item() if hasattr(v, "item") else v)
+                    for k, v in epoch_results.items()
+                })
+            collected[dataset_name] = epoch_results
+            self._print(f"==================== {dataset_name} METRICS =========================")
+            self._print(epoch_results)
+
+            with open(f'{dataset_name}_results_.pkl', 'wb') as f:
+                pickle.dump(epoch_results, f)
+                self._print(f"results saved to .pkl")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        self._print("Start evaluation on KITS and KIRC and TUH test")
         self.model = build_model(self.cfg).cuda()
 
         if not self.cfg.check:
             self._load_checkpoint()
 
-        test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
+        self.cfg.dataloader.kits = False
+        self.cfg.dataloader.kirc = False
+        self.cfg.dataloader.tuh = True
+        self.cfg.dataloader.tuh_extra_data = False
 
-        if torch.distributed.is_initialized():
-            test_metrics = reduce_epoch_results(test_results)
-        else:
-            test_metrics = self.single_gpu_compute_metrics(test_results)
+        _build_and_eval_single_dataset("TUH")
 
-        epoch_results = {}
-        epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
+        self.cfg.dataloader.kits = True
+        self.cfg.dataloader.tuh = False
 
-        self._print(f"==================== KITS METRICS =========================")
-        self._print(epoch_results)
-
-        with open(f'KITS_results_.pkl', 'wb') as f:
-            pickle.dump(epoch_results, f)
-            self._print(f"results saved to .pkl")
-        gc.collect()
-        torch.cuda.empty_cache()
+        _build_and_eval_single_dataset("KITS")
 
         self.cfg.dataloader.kits = False
         self.cfg.dataloader.kirc = True
 
-        self.datamodule = NiftiDataModule(self.cfg)
-        test_loader = self.datamodule.test_loader()
+        _build_and_eval_single_dataset("KIRC")
 
-        test_results = self._run_epoch(self.model, test_loader, total_steps=len(test_loader), train=False)
-
-        if torch.distributed.is_initialized():
-            test_metrics = reduce_epoch_results(test_results)
-        else:
-            test_metrics = self.single_gpu_compute_metrics(test_results)
-
-        epoch_results = {}
-        epoch_results.update({f"{k}_test": v for k, v in test_metrics.items()})
-
-        self._print(f"==================== KIRC METRICS =========================")
-        self._print(epoch_results)
-
-        with open(f'KIRC_results_.pkl', 'wb') as f:
-            pickle.dump(epoch_results, f)
-            self._print(f"results saved to .pkl")
+        if self.is_main_process and getattr(self, "run", None) is not None:
+            self.run.summary.update({
+                "final/checkpoint": str(self.cfg.checkpoint_path),
+                "final/threshold": float(self.threshold),
+                "final/epochs": int(self.cfg.epochs),
+                "final/compass_filter": bool(self.cfg.compass_filter),
+                "final/use_val_split": bool(self.cfg.dataloader.get("use_val_split", True)),
+            })
+            tbl = wandb.Table(columns=["dataset", "auc", "auc_slice_perscan", "f1",
+                                       "recall", "specificity", "n_scans", "n_scans_slice_auc"])
+            for name, r in collected.items():
+                tbl.add_data(name, r.get("auc_roc_test"), r.get("auc_roc_slice_perscan_test"),
+                             r.get("f1_test"), r.get("recall_test"), r.get("specificity_test"),
+                             r.get("n_samples_test"), r.get("n_scans_slice_auc_test"))
+            self.run.log({"final/summary_table": tbl})
 
         if self.cfg.check:
             self._print("Model check completed")

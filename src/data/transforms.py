@@ -96,11 +96,16 @@ def get_augmentation_transforms(mode):
         T.RandFlipd(keys=["image", "segmentation"], prob=0.5, spatial_axis=1),
         T.RandRotate90d(keys=["image", "segmentation"], prob=0.5, spatial_axes=(1, 2)),
         # Mild random zoom
-        # T.RandZoomd(keys=["image", "segmentation"],
-        #             prob=1,
-        #             min_zoom=0.9, max_zoom=1.1,
-        #             mode=("bilinear", "nearest")),
-
+        T.RandZoomd(
+            keys=["image", "segmentation"],
+            prob=0.5,
+            min_zoom=(1.0, 0.8, 0.8),  # (D, H, W) — it was 0.6 for compass
+            max_zoom=(1.0, 1.0, 1.0),
+            mode=("trilinear", "nearest"),
+            padding_mode="constant",  # default is "edge" — see below
+            keep_size=True,
+            align_corners=(False, None)
+        ),
         # Intensity - only on image, not segmentation
         T.RandGaussianNoised(keys=["image"], prob=0.3, mean=0.0, std=0.05),
         T.RandScaleIntensityd(keys=["image"], prob=0.3, factors=0.1)

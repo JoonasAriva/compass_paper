@@ -5,6 +5,9 @@ tuh_extra_data: true
 kits: false
 kirc: false
 
+use_val_split: false
+eval_test_every_epoch: true
+
 batch_size: 1
 train_workers: 4
 val_workers: 2
@@ -17,5 +20,6 @@ prefetch_factor: 2
 name: 2d_slice
 subsample_slices: True
 use_cached_features: False
+val_split_file: /users/arivajoo/compass_paper/val_split.json
 features_dir: None #/scratch/project_465002884/2d_slice_imagenet_features #/scratch/project_465002884/2d_slice_compass_features
 cache_dir: /scratch/project_465002884/monai_cache/${dataloader.name}/sp${dataloader.spacing[0]}_${dataloader.spacing[1]}_crop${dataloader.depth_crop}_ax${dataloader.axial_crop}

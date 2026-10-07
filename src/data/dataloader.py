@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 from functools import partial
 from pathlib import Path
@@ -42,8 +43,10 @@ class CTDataset(TorchDataset):
         self.labels = control_labels + tumor_labels
 
         if cfg.compass_filter == True:
-            train_path = '/users/arivajoo/compass_paper/train_set_compass_scores_2d_slice_vol2.csv'
-            test_path = '/users/arivajoo/compass_paper/test_set_compass_scores_joined_tuh_kits_kirc_2d_slice.csv'
+            # train_path = '/users/arivajoo/compass_paper/train_set_compass_scores_2d_slice_vol2.csv'
+            # test_path = '/users/arivajoo/compass_paper/test_set_compass_scores_joined_tuh_kits_kirc_2d_slice.csv'
+            train_path = "/users/arivajoo/compass_paper/train_set_compass_scores_2d_slice_okt.csv"
+            test_path = "/users/arivajoo/compass_paper/test_set_compass_scores_2d_slice_okt.csv"
             self.compass_filter = CompassFilter(df_train_path=train_path, df_test_path=test_path)
         else:
             self.compass_filter = None
@@ -98,7 +101,7 @@ class CTDataset(TorchDataset):
         if self.compass_filter:
             start_idx, end_idx = self.compass_filter.get_indexes(case_id=self.data[idx]["image"])
 
-            if start_idx is not None and end_idx > start_idx:
+            if start_idx is not None and end_idx - start_idx > 1:
                 item["image"] = item["image"][:, start_idx:end_idx, :, :]
                 item["segmentation"] = item["segmentation"][:, start_idx:end_idx, :, :]
         else:
@@ -117,7 +120,7 @@ class CTDataset(TorchDataset):
         item["slice_classes"] = (seg == 2).any(dim=(0, 2, 3))
         item["normal_kidney_slices"] = (seg == 1).any(dim=(0, 2, 3))
 
-        num_slices = item["image"].shape[1]
+        num_slices = item["slice_classes"].shape[0]
         item["bag_index"] = torch.full((num_slices,), idx, dtype=torch.long)  # each slice tagged with scan idx
         return item
 
@@ -156,7 +159,7 @@ class CTDataset(TorchDataset):
 
         if self.compass_filter is not None:
             start_idx, end_idx = self.compass_filter.get_indexes(case_id=scan_path)
-            if start_idx is not None and end_idx > start_idx:
+            if start_idx is not None and end_idx - start_idx > 1:
                 features = features[start_idx:end_idx]
                 slice_classes = slice_classes[start_idx:end_idx]
                 normal_kidney_slices = normal_kidney_slices[start_idx:end_idx]
@@ -185,6 +188,20 @@ class NiftiDataModule:
         train_controls, train_cases = self._collect_data_paths("train")
         test_controls, test_cases = self._collect_data_paths("test")
 
+        use_val = (self.cfg.experiment != "compass") and self.cfg.dataloader.get("use_val_split", True)
+
+        if not use_val:
+            val_controls, val_cases = [], []
+        else:
+            print("Datamodule is going for the val split")
+            val_ids = set(json.load(open(self.cfg.dataloader.val_split_file)))
+
+            val_controls = [p for p in train_controls if p in val_ids]
+            val_cases = [p for p in train_cases if p in val_ids]
+            train_controls = [p for p in train_controls if p not in val_ids]
+            train_cases = [p for p in train_cases if p not in val_ids]
+            print("Val controls: ", len(val_controls), "Val cases: ", len(val_cases), "Train controls: ",
+                  len(train_controls), "Train cases: ", len(train_cases))
         if self.use_cached_features:
             # No raw NIfTI / MONAI cache dir needed at all in this mode --
             # compass filtering, patch extraction, and deterministic
@@ -198,6 +215,7 @@ class NiftiDataModule:
                 (test_controls, test_cases), transforms=None, cfg=cfg,
                 features_dir=f"{features_dir}/test",
             )
+            self.val_dataset = None  # TODO for frozen feature vector experiments
         else:
 
             cache_dir = cfg.dataloader.cache_dir
@@ -216,16 +234,20 @@ class NiftiDataModule:
                 transform=det_transforms,
                 cache_dir=f"{cache_dir}/test",
             )
+            val_persistent = PersistentDataset(data=make_data_dict(val_controls, val_cases), transform=det_transforms,
+                                               cache_dir=f"{cache_dir}/train")
 
             self.train_dataset = CTDataset((train_controls, train_cases), get_augmentation_transforms("train"), cfg,
                                            persistent_ds=train_persistent)
+            self.val_dataset = (CTDataset((val_controls, val_cases), None, cfg, persistent_ds=val_persistent)
+                                if val_cases or val_controls else None)
             self.test_dataset = CTDataset((test_controls, test_cases), None, cfg, persistent_ds=test_persistent)
         if len(self.train_dataset) == 0:
             self.test_eval = True
         else:
             self.test_eval = False
 
-        self.train_sampler, self.test_sampler = self._build_sampler()
+        self.train_sampler, self.val_sampler, self.test_sampler = self._build_sampler()
 
     def _collect_data_paths(self, split: str):
         print("Split ", split)
@@ -247,13 +269,11 @@ class NiftiDataModule:
                 print("Path: ", path, "cases: ", len(tuh_cases), "controls: ", len(tuh_controls))
 
         if self.cfg.dataloader.kits:
-            split = "*"  # all data goes to test for evaluating
             kits = glob.glob(f"{base}data/imagesTr/{split}/kits_*.nii.gz")
             tumors += kits
             print("Kits cases: ", len(kits))
 
         if self.cfg.dataloader.kirc:
-            split = "*"
             kirc = glob.glob(f"{base}data/imagesTr/{split}/TCGA-*.nii.gz")
             tumors += kirc
             print("Kirc cases: ", len(kirc))
@@ -261,23 +281,31 @@ class NiftiDataModule:
         return controls, tumors
 
     def _build_sampler(self):
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1)) if self.cfg.distributed else 1
+        rank = int(os.environ.get("RANK", 0)) if self.cfg.distributed else 0
+
+        def eval_sampler(ds):
+            return UnevenDistributedSampler(ds, num_replicas=world_size, rank=rank) if self.cfg.distributed else None
 
         if self.test_eval:
-            if self.cfg.distributed:
-                return None, DistributedSampler(self.test_dataset, num_replicas=world_size,
-                                                rank=rank, shuffle=False)
-            return None, None
+            return None, None, eval_sampler(self.test_dataset)
 
-        sampler = DistributedBalancedSampler(
-            labels=[int(l[0]) for l in self.train_dataset.labels],
-            num_replicas=world_size if self.cfg.distributed else 1,
-            rank=rank if self.cfg.distributed else 0,
-            seed=self.cfg.seed,
-        )
-        sampler_test = UnevenDistributedSampler(self.test_dataset, num_replicas=world_size, rank=rank) if self.cfg.distributed else None
-        return sampler, sampler_test
+        if self.cfg.experiment == "compass":  # Compass: self-supervised, labels irrelevant
+            if self.cfg.distributed:
+                sampler = DistributedSampler(self.train_dataset, num_replicas=world_size,
+                                             rank=rank, shuffle=True, seed=self.cfg.seed)
+            else:
+                sampler = torch.utils.data.RandomSampler(self.train_dataset)
+        else:  # classification: balanced epochs
+            sampler = DistributedBalancedSampler(
+                labels=[int(l[0]) for l in self.train_dataset.labels],
+                num_replicas=world_size,
+                rank=rank,
+                seed=self.cfg.seed,
+            )
+
+        return sampler, eval_sampler(self.val_dataset) if self.val_dataset is not None else None, eval_sampler(
+            self.test_dataset)
 
     def _make_loader(self, dataset, sampler, train: bool, shuffle: bool):
         collate_fn = partial(custom_collate, patch_mode=self.cfg.patch_mode,
@@ -290,8 +318,8 @@ class NiftiDataModule:
             pin_memory=True,
             persistent_workers=True,
             prefetch_factor=self.cfg.dataloader.prefetch_factor,
-            sampler=sampler,
             collate_fn=collate_fn,
+            sampler=sampler,
             generator=torch.Generator().manual_seed(self.cfg.seed + int(os.environ.get("LOCAL_RANK", 0))),
             worker_init_fn=worker_init_fn,
         )
@@ -302,6 +330,11 @@ class NiftiDataModule:
     def test_loader(self):
         return self._make_loader(self.test_dataset, sampler=self.test_sampler, train=False,
                                  shuffle=self.cfg.notebook_eval)
+
+    def val_loader(self):
+        if self.val_dataset is None or len(self.val_dataset) == 0:
+            return None
+        return self._make_loader(self.val_dataset, sampler=self.val_sampler, train=False, shuffle=False)
 
 
 import random
